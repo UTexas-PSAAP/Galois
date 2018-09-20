@@ -11,6 +11,7 @@
 #include "galois/graphs/Graph.h"
 #include "galois/graphs/MorphGraph.h"
 #include "galois/graphs/FileGraph.h"
+#include "galois/runtime/Context.h"
 #include "galois/substrate/PerThreadStorage.h"
 #include "llvm/Support/CommandLine.h"
 #include "Lonestar/BoilerPlate.h"
@@ -74,6 +75,8 @@ void print_deps(Graph &g) {
   }
 }
 
+using PSChunk = galois::worklists::PerSocketChunkFIFO<16>;
+
 int main(int argc, char** argv) {
   galois::SharedMemSys G;
   LonestarStart(argc, argv, name, desc, url);
@@ -101,8 +104,45 @@ int main(int argc, char** argv) {
   //if (stat != CUBLAS_STATUS_SUCCESS) {
   //  GALOIS_DIE("Failed to initialize cublas.");
   //}
+  auto locks = std::make_unique<galois::runtime::Lockable[]>(nblocks * nblocks);
 
-  auto locks = std::make_unique<std::mutex[]>(nblocks * nblocks);
+  galois::for_each(
+    galois::iterate({label_map[task_label(0, 0, 0, 2)]}),
+    [&](GNode n, auto& ctx) {
+      auto &d = g.getData(n);
+      auto task_type = std::get<4>(d);
+      if (task_type == 1) {
+        auto j = std::get<2>(d);
+        auto k = std::get<3>(d);
+        galois::runtime::doAcquire(&(locks.get()[j + nblocks * j]), galois::MethodFlag::WRITE);
+        galois::runtime::doAcquire(&(locks.get()[j + nblocks * k]), galois::MethodFlag::READ);
+      } else if (task_type == 2) {
+        auto j = std::get<3>(d);
+        galois::runtime::doAcquire(&(locks.get()[j + nblocks * j]), galois::MethodFlag::WRITE);
+      } else if (task_type == 3) {
+        auto i = std::get<1>(d);
+        auto j = std::get<2>(d);
+        auto k = std::get<3>(d);
+        galois::runtime::doAcquire(&(locks.get()[i + nblocks * j]), galois::MethodFlag::WRITE);
+        galois::runtime::doAcquire(&(locks.get()[i + nblocks * k]), galois::MethodFlag::READ);
+        galois::runtime::doAcquire(&(locks.get()[j + nblocks * k]), galois::MethodFlag::READ);
+      } else if (task_type == 4) {
+        auto i = std::get<2>(d);
+        auto j = std::get<3>(d);
+        galois::runtime::doAcquire(&(locks.get()[j + nblocks * j]), galois::MethodFlag::READ);
+        galois::runtime::doAcquire(&(locks.get()[i + nblocks * j]), galois::MethodFlag::WRITE);
+      } else {
+        GALOIS_DIE("Unrecognized task type.");
+      }
+      for (auto e : g.edges(n, galois::MethodFlag::UNPROTECTED)) {
+        auto dst = g.getEdgeDst(e);
+        if (0 == --std::get<0>(g.getData(dst, galois::MethodFlag::UNPROTECTED))) {
+          ctx.push(dst);
+        }
+      }
+    },
+    galois::loopname("cholesky_tasks"), galois::wl<PSChunk>()
+  );
 
   galois::on_each([&](unsigned int tid, unsigned int nthreads) {
     cublasDestroy(*handles.getLocal());
