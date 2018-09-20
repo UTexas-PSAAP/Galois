@@ -1,7 +1,9 @@
 #include <atomic>
 #include <cstddef>
 #include <mutex>
+#include <random>
 #include <tuple>
+#include <utility>
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -16,12 +18,13 @@
 #include "llvm/Support/CommandLine.h"
 #include "Lonestar/BoilerPlate.h"
 
-static const char* name = "Task based Cholesky Factorization";
+static const char* name = "Task Based Cholesky Factorization";
 static const char* desc = "";
 static const char* url = "cholesky_task";
 
 static llvm::cl::opt<int> dim_size("dim_size", llvm::cl::desc("Number of rows/columns in main matrix."), llvm::cl::init(100));
 static llvm::cl::opt<int> block_size("block_size", llvm::cl::desc("Number of rows/columns in each block."), llvm::cl::init(10));
+static llvm::cl::opt<std::size_t> seed("seed", llvm::cl::desc("Seed used to generate symmetric positive definite matrix."), llvm::cl::init(0));
 
 using task_data = std::tuple<std::atomic<std::size_t>, int, int, int, char>;
 using task_label = std::tuple<int, int, int, char>;
@@ -75,6 +78,39 @@ void print_deps(Graph &g) {
   }
 }
 
+decltype(auto) generate_symmetric_positive_definite(std::size_t size, std::size_t seed) {
+  auto tmp = std::make_unique<double[]>(size * size);
+  auto out = std::make_unique<double[]>(size * size);
+  std::mt19937 gen{seed};
+  std::uniform_real_distribution<> dis(-1., 1.);
+  for (std::size_t i = 0; i < size; i++) {
+    for (std::size_t j = 0; j < size; j++) {
+      tmp.get()[j + size * i] = dis(gen);
+      //std::cout << tmp.get()[j + size * i] << "  ";
+    }
+    //std::cout << std::endl;
+  }
+  //std::cout << std::endl;
+  // This really just computes tmp.T @ tmp.
+  // There's no guarantee this whole thing will fit nicely into the gpu memory
+  // though, and we aren't linking against any BLAS other than CUBLAS, so
+  // we'll just do slow three nested loops here.
+  for (std::size_t i = 0; i < size * size; i++) {
+    out.get()[i] = 0.;
+  }
+  for (std::size_t i = 0; i < size; i++) {
+    for (std::size_t j = 0; j < size; j++) {
+      for (std::size_t k = 0; k < size; k++) {
+        out.get()[j + size * i] += tmp.get()[k + size * j] * tmp.get()[k + size * i];
+      }
+      //std::cout << out.get()[j + size * i] << "  ";
+    }
+    //std::cout << std::endl;
+  }
+  //std::cout << std::endl;
+  return out;
+}
+
 using PSChunk = galois::worklists::PerSocketChunkFIFO<16>;
 
 int main(int argc, char** argv) {
@@ -84,6 +120,9 @@ int main(int argc, char** argv) {
   if (dim_size % block_size != 0) {
     GALOIS_DIE("Blocks that do not evenly divide the array dimensions are not yet supported");
   }
+
+  auto spd_manager = generate_symmetric_positive_definite(dim_size, seed);
+  auto spd = spd_manager.get();
 
   Graph g;
   LMap label_map;
