@@ -133,10 +133,32 @@ int main(int argc, char** argv) {
   // Now execute the tasks.
   //cublasHandle_t handle;
   galois::substrate::PerThreadStorage<cublasHandle_t> handles;
+  auto cufree = [](double *p) {
+    auto stat = cudaFree(reinterpret_cast<void*>(p));
+    if (stat != cudaSuccess) {
+      GALOIS_DIE("Failed to free gpu buffer for blocks.");
+    }
+  };
+  using cufree_type = void(*)(double *);
+  galois::substrate::PerThreadStorage<double*> b0s;
+  galois::substrate::PerThreadStorage<double*> b1s;
+  galois::substrate::PerThreadStorage<double*> b2s;
   galois::on_each([&](unsigned int tid, unsigned int nthreads) {
     auto stat = cublasCreate(handles.getLocal());
     if (stat != CUBLAS_STATUS_SUCCESS) {
       GALOIS_DIE("Failed to initialize cublas");
+    }
+    auto stat2 = cudaMalloc(b0s.getLocal(), static_cast<std::size_t>(block_size * block_size));
+    if (stat2 != cudaSuccess) {
+      GALOIS_DIE("Failed to allocate GPU buffers for blocked operations.");
+    }
+    stat2 = cudaMalloc(b1s.getLocal(), static_cast<std::size_t>(block_size * block_size));
+    if (stat2 != cudaSuccess) {
+      GALOIS_DIE("Failed to allocate GPU buffers for blocked operations.");
+    }
+    stat2 = cudaMalloc(b2s.getLocal(), static_cast<std::size_t>(block_size * block_size));
+    if (stat2 != cudaSuccess) {
+      GALOIS_DIE("Failed to allocate GPU buffers for blocked operations.");
     }
   });
   //auto stat = cublasCreate(&handle);
@@ -184,7 +206,22 @@ int main(int argc, char** argv) {
   );
 
   galois::on_each([&](unsigned int tid, unsigned int nthreads) {
-    cublasDestroy(*handles.getLocal());
+    auto stat = cudaFree(reinterpret_cast<void*>(*b0s.getLocal()));
+    if (stat != cudaSuccess) {
+      GALOIS_DIE("Failed to free gpu buffer for blocks.");
+    }
+    stat = cudaFree(reinterpret_cast<void*>(*b1s.getLocal()));
+    if (stat != cudaSuccess) {
+      GALOIS_DIE("Failed to free gpu buffer for blocks.");
+    }
+    stat = cudaFree(reinterpret_cast<void*>(*b2s.getLocal()));
+    if (stat != cudaSuccess) {
+      GALOIS_DIE("Failed to free gpu buffer for blocks.");
+    }
+    auto stat2 = cublasDestroy(*handles.getLocal());
+    if (stat2 != CUBLAS_STATUS_SUCCESS) {
+      GALOIS_DIE("Failed to free cublas resources.");
+    }
   });
   //cublasDestroy(handle);
   
