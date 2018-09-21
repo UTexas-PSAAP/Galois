@@ -134,6 +134,30 @@ void print_cublas_status(cublasStatus_t stat) {
     std::cout << "CUBLAS_STATUS_NOT_SUPPORTED" << std::endl;
   } else if (stat == CUBLAS_STATUS_LICENSE_ERROR) {
     std::cout << "CUBLAS_STATUS_LICENSE_ERROR" << std::endl;
+  } else {
+    std::cout << "Unknown cublas status." << std::endl;
+  }
+}
+
+void print_cusolver_status(cusolverStatus_t stat) {
+  if (stat == CUSOLVER_STATUS_SUCCESS) {
+    std::cout << "CUSOLVER_STATUS_SUCCESS" << std::endl;
+  } else if (stat == CUSOLVER_STATUS_NOT_INITIALIZED) {
+    std::cout << "CUSOLVER_STATUS_NOT_INITIALIZED" << std::endl;
+  } else if (stat == CUSOLVER_STATUS_ALLOC_FAILED) {
+    std::cout << "CUSOLVER_STATUS_ALLOC_FAILED" << std::endl;
+  } else if (stat == CUSOLVER_STATUS_INVALID_VALUE) {
+    std::cout << "CUSOLVER_STATUS_INVALID_VALUE" << std::endl;
+  } else if (stat == CUSOLVER_STATUS_ARCH_MISMATCH) {
+    std::cout << "CUSOLVER_STATUS_ARCH_MISMATCH" << std::endl;
+  } else if (stat == CUSOLVER_STATUS_EXECUTION_FAILED) {
+    std::cout << "CUSOLVER_STATUS_EXECUTION_FAILED" << std::endl;
+  } else if (stat == CUSOLVER_STATUS_INTERNAL_ERROR) {
+    std::cout << "CUSOLVER_STATUS_INTERNAL_ERROR" << std::endl;
+  } else if (stat == CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED) {
+    std::cout << "CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED" << std::endl;
+  } else {
+    std::cout << "Unknown cusolver status." << std::endl;
   }
 }
 
@@ -164,6 +188,7 @@ int main(int argc, char** argv) {
   galois::substrate::PerThreadStorage<double*> b0s;
   galois::substrate::PerThreadStorage<double*> b1s;
   galois::substrate::PerThreadStorage<double*> b2s;
+  galois::substrate::PerThreadStorage<double*> lworks;
   galois::on_each([&](unsigned int tid, unsigned int nthreads) {
     auto stat = cublasCreate(handles.getLocal());
     if (stat != CUBLAS_STATUS_SUCCESS) {
@@ -173,17 +198,20 @@ int main(int argc, char** argv) {
     if (stat2 != CUSOLVER_STATUS_SUCCESS) {
       GALOIS_DIE("Failed to initialize cusolver.");
     }
-    auto stat3 = cudaMalloc(b0s.getLocal(), static_cast<std::size_t>(block_size * block_size));
+    stat2 = cusolverDnDpotrf_bufferSize(*cusolver_handles.getLocal(), CUBLAS_FILL_MODE_LOWER, block_size, *b0s.getLocal(), block_size, lwork_sizes.getLocal());
+    if (stat2 != cudaSuccess) {
+      GALOIS_DIE("Failed to determine lwork size for cusolver dpotrf.");
+    }
+    auto stat3 = cudaMalloc(lworks.getLocal(), static_cast<std::size_t>(((*lwork_sizes.getLocal()) * sizeof(double))));
+    stat3 = cudaMalloc(b0s.getLocal(), static_cast<std::size_t>(block_size * block_size * sizeof(double)));
     if (stat3 != cudaSuccess) {
       GALOIS_DIE("Failed to allocate GPU buffers for blocked operations.");
     }
-    // Maybe make this one slightly larger so it can be used as an "lwork" buffer for dpotrf.
-    cusolverDnDpotrf_bufferSize(*cusolver_handles.getLocal(), CUBLAS_FILL_MODE_LOWER, block_size, *b0s.getLocal(), block_size, lwork_sizes.getLocal());
-    stat3 = cudaMalloc(b1s.getLocal(), static_cast<std::size_t>(std::max(*lwork_sizes.getLocal(), block_size * block_size)));
+    stat3 = cudaMalloc(b1s.getLocal(), static_cast<std::size_t>(block_size * block_size * sizeof(double)));
     if (stat3 != cudaSuccess) {
       GALOIS_DIE("Failed to allocate GPU buffers for blocked operations.");
     }
-    stat3 = cudaMalloc(b2s.getLocal(), static_cast<std::size_t>(block_size * block_size));
+    stat3 = cudaMalloc(b2s.getLocal(), static_cast<std::size_t>(block_size * block_size * sizeof(double)));
     if (stat3 != cudaSuccess) {
       GALOIS_DIE("Failed to allocate GPU buffers for blocked operations.");
     }
@@ -221,13 +249,13 @@ int main(int argc, char** argv) {
         auto j = std::get<3>(d);
         galois::runtime::doAcquire(&(locks.get()[j + nblocks * j]), galois::MethodFlag::WRITE);
         auto b0 = *b0s.getLocal();
-        auto b1 = *b1s.getLocal();
+        auto lwork = *lworks.getLocal();
+        auto lwork_size = *lwork_sizes.getLocal();
         auto cusolver_handle = *cusolver_handles.getLocal();
         auto stat = cublasSetMatrix(block_size, block_size, sizeof(double), spd + j + j * dim_size, dim_size, b0, block_size);
-        print_cublas_status(stat);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed. (5)");
         int info = 0;
-        auto stat2 = cusolverDnDpotrf(cusolver_handle, CUBLAS_FILL_MODE_LOWER, block_size, b0, block_size, b1, *lwork_sizes.getLocal(), &info);
+        auto stat2 = cusolverDnDpotrf(cusolver_handle, CUBLAS_FILL_MODE_LOWER, block_size, b0, block_size, lwork, lwork_size, &info);
         if (stat2 != CUSOLVER_STATUS_SUCCESS) GALOIS_DIE("Cholesky block solve failed. (6)");
         if (info != 0) {
           if (info < 0) GALOIS_DIE("Incorrect parameter passed to dpotrf. (7)");
