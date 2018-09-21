@@ -182,8 +182,9 @@ int main(int argc, char** argv) {
 
   // Now execute the tasks.
   //cublasHandle_t handle;
-  galois::substrate::PerThreadStorage<cublasHandle_t> handles;
-  galois::substrate::PerThreadStorage<cusolverDnHandle_t> cusolver_handles;
+  galois::substrate::PerThreadStorage<cublasHandle_t> handles(nullptr);
+  galois::substrate::PerThreadStorage<cusolverDnHandle_t> cusolver_handles(nullptr);
+  galois::substrate::PerThreadStorage<cudaStream_t> cusolver_streams(nullptr);
   galois::substrate::PerThreadStorage<int> lwork_sizes;
   galois::substrate::PerThreadStorage<double*> b0s;
   galois::substrate::PerThreadStorage<double*> b1s;
@@ -198,11 +199,19 @@ int main(int argc, char** argv) {
     if (stat2 != CUSOLVER_STATUS_SUCCESS) {
       GALOIS_DIE("Failed to initialize cusolver.");
     }
+    auto stat3 = cudaStreamCreateWithFlags(cusolver_streams.getLocal(), cudaStreamNonBlocking);
+    if (stat3 != cudaSuccess) {
+      GALOIS_DIE("Failed to acquire cuda stream.");
+    }
+    stat2 = cusolverDnSetStream(*cusolver_handles.getLocal(), *cusolver_streams.getLocal());
+    if (stat2 != CUSOLVER_STATUS_SUCCESS) {
+      GALOIS_DIE("Failed to set stream for cusolver.");
+    }
     stat2 = cusolverDnDpotrf_bufferSize(*cusolver_handles.getLocal(), CUBLAS_FILL_MODE_LOWER, block_size, *b0s.getLocal(), block_size, lwork_sizes.getLocal());
     if (stat2 != cudaSuccess) {
       GALOIS_DIE("Failed to determine lwork size for cusolver dpotrf.");
     }
-    auto stat3 = cudaMalloc(lworks.getLocal(), static_cast<std::size_t>(((*lwork_sizes.getLocal()) * sizeof(double))));
+    stat3 = cudaMalloc(lworks.getLocal(), static_cast<std::size_t>(((*lwork_sizes.getLocal()) * sizeof(double))));
     stat3 = cudaMalloc(b0s.getLocal(), static_cast<std::size_t>(block_size * block_size * sizeof(double)));
     if (stat3 != cudaSuccess) {
       GALOIS_DIE("Failed to allocate GPU buffers for blocked operations.");
@@ -256,6 +265,8 @@ int main(int argc, char** argv) {
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed. (5)");
         int info = 0;
         auto stat2 = cusolverDnDpotrf(cusolver_handle, CUBLAS_FILL_MODE_LOWER, block_size, b0, block_size, lwork, lwork_size, &info);
+        //std::cout << j << std::endl;
+        //print_cusolver_status(stat2);
         if (stat2 != CUSOLVER_STATUS_SUCCESS) GALOIS_DIE("Cholesky block solve failed. (6)");
         if (info != 0) {
           if (info < 0) GALOIS_DIE("Incorrect parameter passed to dpotrf. (7)");
@@ -333,9 +344,17 @@ int main(int argc, char** argv) {
     if (stat2 != CUSOLVER_STATUS_SUCCESS) {
       GALOIS_DIE("Failed to free cusolver resources.");
     }
+    stat = cudaStreamDestroy(*cusolver_streams.getLocal());
+    if (stat != cudaSuccess) {
+      GALOIS_DIE("Failed to free cuda stream for cusolver.");
+    }
     auto stat3 = cublasDestroy(*handles.getLocal());
     if (stat3 != CUBLAS_STATUS_SUCCESS) {
       GALOIS_DIE("Failed to free cublas resources.");
+    }
+    stat = cudaDeviceReset();
+    if (stat != cudaSuccess) {
+      GALOIS_DIE("Failed to reset cuda device after use");
     }
   });
   //cublasDestroy(handle);
