@@ -24,8 +24,8 @@ static const char* name = "Task Based Cholesky Factorization";
 static const char* desc = "";
 static const char* url = "cholesky_task";
 
-static llvm::cl::opt<int> dim_size("dim_size", llvm::cl::desc("Number of rows/columns in main matrix."), llvm::cl::init(100));
-static llvm::cl::opt<int> block_size("block_size", llvm::cl::desc("Number of rows/columns in each block."), llvm::cl::init(10));
+static llvm::cl::opt<int> dim_size("dim_size", llvm::cl::desc("Number of rows/columns in main matrix."), llvm::cl::init(9));
+static llvm::cl::opt<int> block_size("block_size", llvm::cl::desc("Number of rows/columns in each block."), llvm::cl::init(3));
 static llvm::cl::opt<std::size_t> seed("seed", llvm::cl::desc("Seed used to generate symmetric positive definite matrix."), llvm::cl::init(0));
 
 using task_data = std::tuple<std::atomic<std::size_t>, int, int, int, char>;
@@ -161,6 +161,16 @@ void print_cusolver_status(cusolverStatus_t stat) {
   }
 }
 
+void print_mat(double *m, std::size_t rows, std::size_t cols, std::ptrdiff_t row_stride) {
+  for (std::size_t i = 0; i < rows; i++) {
+    for (std::size_t j = 0; j < cols; j++) {
+      std::cout << m[i + j * row_stride] << " ";
+    }
+    std::cout << std::endl;
+  }
+  std::cout << std::endl;
+}
+
 using PSChunk = galois::worklists::PerSocketChunkFIFO<16>;
 
 int main(int argc, char** argv) {
@@ -173,6 +183,8 @@ int main(int argc, char** argv) {
 
   auto spd_manager = generate_symmetric_positive_definite(dim_size, seed);
   auto spd = spd_manager.get();
+  //std::cout << "generated input:" << std::endl;
+  //print_mat(spd, dim_size, dim_size, dim_size);
 
   Graph g;
   LMap label_map;
@@ -190,6 +202,7 @@ int main(int argc, char** argv) {
   galois::substrate::PerThreadStorage<double*> b1s;
   galois::substrate::PerThreadStorage<double*> b2s;
   galois::substrate::PerThreadStorage<double*> lworks;
+  galois::substrate::PerThreadStorage<int*> dev_infos;
   galois::on_each([&](unsigned int tid, unsigned int nthreads) {
     auto stat = cublasCreate(handles.getLocal());
     if (stat != CUBLAS_STATUS_SUCCESS) {
@@ -212,6 +225,13 @@ int main(int argc, char** argv) {
       GALOIS_DIE("Failed to determine lwork size for cusolver dpotrf.");
     }
     stat3 = cudaMalloc(lworks.getLocal(), static_cast<std::size_t>(((*lwork_sizes.getLocal()) * sizeof(double))));
+    if (stat3 != cudaSuccess) {
+      GALOIS_DIE("Failed to allocate GPU workspace for per-block Cholesky factorization.");
+    }
+    stat3 = cudaMalloc(dev_infos.getLocal(), sizeof(int));
+    if (stat3 != cudaSuccess) {
+      GALOIS_DIE("Failed to allocate GPU int for Cholesky call status.");
+    }
     stat3 = cudaMalloc(b0s.getLocal(), static_cast<std::size_t>(block_size * block_size * sizeof(double)));
     if (stat3 != cudaSuccess) {
       GALOIS_DIE("Failed to allocate GPU buffers for blocked operations.");
@@ -256,6 +276,7 @@ int main(int argc, char** argv) {
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Recieve from GPU failed. (4)");
       } else if (task_type == 2) {
         auto j = std::get<3>(d);
+        //if (j == 0) (std::cout << "before:" << std::endl, print_mat(spd, block_size, block_size, dim_size));
         galois::runtime::doAcquire(&(locks.get()[j + nblocks * j]), galois::MethodFlag::WRITE);
         auto b0 = *b0s.getLocal();
         auto lwork = *lworks.getLocal();
@@ -264,16 +285,17 @@ int main(int argc, char** argv) {
         auto stat = cublasSetMatrix(block_size, block_size, sizeof(double), spd + j + j * dim_size, dim_size, b0, block_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed. (5)");
         int info = 0;
-        auto stat2 = cusolverDnDpotrf(cusolver_handle, CUBLAS_FILL_MODE_LOWER, block_size, b0, block_size, lwork, lwork_size, &info);
-        //std::cout << j << std::endl;
-        //print_cusolver_status(stat2);
+        auto stat2 = cusolverDnDpotrf(cusolver_handle, CUBLAS_FILL_MODE_LOWER, block_size, b0, block_size, lwork, lwork_size, *dev_infos.getLocal());
         if (stat2 != CUSOLVER_STATUS_SUCCESS) GALOIS_DIE("Cholesky block solve failed. (6)");
+        auto stat3 = cudaMemcpy(&info, dev_infos.getLocal(), sizeof(int), cudaMemcpyDeviceToHost);
+        if (stat != cudaSuccess) GALOIS_DIE("Recieve status after Cholesky on block failed. (6.5)");
         if (info != 0) {
           if (info < 0) GALOIS_DIE("Incorrect parameter passed to dpotrf. (7)");
           if (info > 0) GALOIS_DIE("Not positive definite. (8)");
         }
         stat = cublasGetMatrix(block_size, block_size, sizeof(double), b0, block_size, spd + j + j * dim_size, dim_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Recieve from GPU failed. (9)");
+        //if (j == 0) (std::cout << "after:" << std::endl, print_mat(spd, block_size, block_size, dim_size));
       } else if (task_type == 3) {
         auto i = std::get<1>(d);
         auto j = std::get<2>(d);
@@ -327,10 +349,20 @@ int main(int argc, char** argv) {
     galois::loopname("cholesky_tasks"), galois::wl<PSChunk>()
   );
 
+  //print_mat(spd, dim_size, dim_size, dim_size);
+
   galois::on_each([&](unsigned int tid, unsigned int nthreads) {
     auto stat = cudaFree(reinterpret_cast<void*>(*b0s.getLocal()));
     if (stat != cudaSuccess) {
       GALOIS_DIE("Failed to free gpu buffer for blocks.");
+    }
+    stat = cudaFree(reinterpret_cast<void*>(*lworks.getLocal()));
+    if (stat != cudaSuccess) {
+      GALOIS_DIE("Failed to free gpu buffer for cholesky workspace.");
+    }
+    stat = cudaFree(reinterpret_cast<void*>(*dev_infos.getLocal()));
+    if (stat != cudaSuccess) {
+      GALOIS_DIE("Failed to free gpu buffer for cholesky return status.");
     }
     stat = cudaFree(reinterpret_cast<void*>(*b1s.getLocal()));
     if (stat != cudaSuccess) {
