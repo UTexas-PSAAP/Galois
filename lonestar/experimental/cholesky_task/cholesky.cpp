@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <mutex>
 #include <random>
@@ -27,6 +28,7 @@ static const char* url = "cholesky_task";
 static llvm::cl::opt<int> dim_size("dim_size", llvm::cl::desc("Number of rows/columns in main matrix."), llvm::cl::init(9));
 static llvm::cl::opt<int> block_size("block_size", llvm::cl::desc("Number of rows/columns in each block."), llvm::cl::init(3));
 static llvm::cl::opt<std::size_t> seed("seed", llvm::cl::desc("Seed used to generate symmetric positive definite matrix."), llvm::cl::init(0));
+static llvm::cl::opt<double> tolerance("tolerance", llvm::cl::desc("Tolerance used to check that the results are correct."), llvm::cl::init(.001));
 
 using task_data = std::tuple<std::atomic<std::size_t>, int, int, int, char>;
 using task_label = std::tuple<int, int, int, char>;
@@ -105,6 +107,38 @@ decltype(auto) generate_symmetric_positive_definite(std::size_t size, std::size_
     }
   }
   return out;
+}
+
+// Check against a naive cholesky factorization.
+void check_correctness(double *result, std::size_t size, std::size_t seed, double tol) {
+  // Just re-generate the input. In most cases the dominating cost will
+  // be the naive cholesky decomposition below anyway.
+  auto orig_manager = generate_symmetric_positive_definite(size, seed);
+  auto orig = orig_manager.get();
+
+  // Now check that the result satisfies L @ L^T = A where A is the input.
+  // Just use the infinity norm for simplicity here. The main purpose of
+  // the verification is to check that the right calls were made in the tasks.
+  // NOTE: we're only checking the lower triangular portion of the array.
+  // The blocked version actually overwrites some of the superdiagonal
+  // elements with new values. That will cause some differences between
+  // the results of a naive version and the blocke version, but the
+  // relevant output is in the lower-triangular portion of the array,
+  // so the differences in the rest of it don't matter.
+  for (std::size_t i = 0; i < size; i++) {
+    for (std::size_t j = 0; j <= i; j++) {
+      double reconstructed = 0.;
+      for (std::size_t k = 0; k <= j; k++) {
+        reconstructed += result[i + k * size] * result[j + k * size];
+      }
+      auto err = std::abs(orig[i + j * size] - reconstructed);
+      if (err >= tol) {
+        std::stringstream ss;
+        ss << "Verification failed at element (" << i << "," << j << ") with difference " << err << ".";
+        GALOIS_DIE(ss.str());
+      }
+    }
+  }
 }
 
 void print_cublas_status(cublasStatus_t stat) {
@@ -397,6 +431,8 @@ int main(int argc, char** argv) {
       GALOIS_DIE("Failed to reset cuda device after use");
     }
   });
+
+  check_correctness(spd, dim_size, seed, tolerance);
   
   return 0;
 }
