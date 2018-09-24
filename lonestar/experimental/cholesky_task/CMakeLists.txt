@@ -1,9 +1,7 @@
-# Hard code the paths since cmake is apparently unable to find our repackaged cuda 9 without additional help.
-
-link_directories(/org/centers/cdgc/cuda/cuda-9.0/lib64)
+FIND_PACKAGE(CUDA REQUIRED)
 
 app(cholesky-task cholesky.cpp EXP_OPT)
 
-target_include_directories(cholesky-task PRIVATE /org/centers/cdgc/cuda/cuda-9.0/include)
+target_include_directories(cholesky-task PRIVATE ${CUDA_INCLUDE_DIRS})
 
-target_link_libraries(cholesky-task cudart cublas cusolver)
+target_link_libraries(cholesky-task ${CUDA_LIBRARIES} ${CUDA_CUBLAS_LIBRARIES} ${CUDA_cusolver_LIBRARY})
