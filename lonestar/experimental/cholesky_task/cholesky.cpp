@@ -197,6 +197,15 @@ int main(int argc, char** argv) {
   galois::substrate::PerThreadStorage<double*> lworks;
   galois::substrate::PerThreadStorage<int*> dev_infos;
   galois::on_each([&](unsigned int tid, unsigned int nthreads) {
+    int devices = 0;
+    auto stat3 = cudaGetDeviceCount(&devices);
+    if (devices > nthreads) {
+      GALOIS_DIE("The number of threads desired is greater than the number of cuda devices available.");
+    }
+    stat3 = cudaSetDevice(tid);
+    if (stat3 != cudaSuccess) {
+      GALOIS_DIE("Failed to allocate one device per thread.");
+    }
     auto stat = cublasCreate(handles.getLocal());
     if (stat != CUBLAS_STATUS_SUCCESS) {
       GALOIS_DIE("Failed to initialize cublas.");
@@ -205,7 +214,7 @@ int main(int argc, char** argv) {
     if (stat2 != CUSOLVER_STATUS_SUCCESS) {
       GALOIS_DIE("Failed to initialize cusolver.");
     }
-    auto stat3 = cudaStreamCreateWithFlags(cusolver_streams.getLocal(), cudaStreamNonBlocking);
+    stat3 = cudaStreamCreateWithFlags(cusolver_streams.getLocal(), cudaStreamNonBlocking);
     if (stat3 != cudaSuccess) {
       GALOIS_DIE("Failed to acquire cuda stream.");
     }
