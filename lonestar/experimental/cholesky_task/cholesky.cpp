@@ -27,7 +27,7 @@ static const char* url = "cholesky_task";
 
 static llvm::cl::opt<int> dim_size("dim_size", llvm::cl::desc("Number of rows/columns in main matrix."), llvm::cl::init(9));
 static llvm::cl::opt<int> block_size("block_size", llvm::cl::desc("Number of rows/columns in each block."), llvm::cl::init(3));
-static llvm::cl::opt<std::size_t> seed("seed", llvm::cl::desc("Seed used to generate symmetric positive definite matrix."), llvm::cl::init(0));
+static llvm::cl::opt<int> seed("seed", llvm::cl::desc("Seed used to generate symmetric positive definite matrix."), llvm::cl::init(0));
 static llvm::cl::opt<double> tolerance("tolerance", llvm::cl::desc("Tolerance used to check that the results are correct."), llvm::cl::init(.001));
 
 using task_data = std::tuple<std::atomic<std::size_t>, int, int, int, char>;
@@ -125,16 +125,26 @@ void check_correctness(double *result, std::size_t size, std::size_t seed, doubl
   // the results of a naive version and the blocke version, but the
   // relevant output is in the lower-triangular portion of the array,
   // so the differences in the rest of it don't matter.
+
+  // First get the infinity norm of the array so we can compute the relative error.
+  double nrm = 0.;
+  for (std::size_t i = 0; i < size; i++) {
+    for (std::size_t j = 0; j < i; j++) {
+      nrm = std::max(nrm, std::abs(orig[i + j * size]));
+    }
+  }
+  // Now compute the relative error at each element and check that
+  // it's within the tolerance.
   for (std::size_t i = 0; i < size; i++) {
     for (std::size_t j = 0; j <= i; j++) {
       double reconstructed = 0.;
       for (std::size_t k = 0; k <= j; k++) {
         reconstructed += result[i + k * size] * result[j + k * size];
       }
-      auto err = std::abs(orig[i + j * size] - reconstructed);
-      if (err >= tol) {
+      auto rel_err = std::abs(orig[i + j * size] - reconstructed) / nrm;
+      if (rel_err >= tol) {
         std::stringstream ss;
-        ss << "Verification failed at element (" << i << "," << j << ") with difference " << err << ".";
+        ss << "Verification failed at element (" << i << "," << j << ") with difference " << rel_err << ".";
         GALOIS_DIE(ss.str());
       }
     }
@@ -211,6 +221,7 @@ int main(int argc, char** argv) {
 
   auto spd_manager = generate_symmetric_positive_definite(dim_size, seed);
   auto spd = spd_manager.get();
+  //std::cout.precision(19);
   //std::cout << "generated input:" << std::endl;
   //print_mat(spd, dim_size, dim_size, dim_size);
 
@@ -223,7 +234,7 @@ int main(int argc, char** argv) {
   // Now set up the needed resources for each thread.
   galois::substrate::PerThreadStorage<cublasHandle_t> handles(nullptr);
   galois::substrate::PerThreadStorage<cusolverDnHandle_t> cusolver_handles(nullptr);
-  galois::substrate::PerThreadStorage<cudaStream_t> cusolver_streams(nullptr);
+  //galois::substrate::PerThreadStorage<cudaStream_t> cusolver_streams(nullptr);
   galois::substrate::PerThreadStorage<int> lwork_sizes;
   galois::substrate::PerThreadStorage<double*> b0s;
   galois::substrate::PerThreadStorage<double*> b1s;
@@ -233,7 +244,7 @@ int main(int argc, char** argv) {
   galois::on_each([&](unsigned int tid, unsigned int nthreads) {
     int devices = 0;
     auto stat3 = cudaGetDeviceCount(&devices);
-    if (devices > nthreads) {
+    if (devices < nthreads) {
       GALOIS_DIE("The number of threads desired is greater than the number of cuda devices available.");
     }
     stat3 = cudaSetDevice(tid);
@@ -248,14 +259,14 @@ int main(int argc, char** argv) {
     if (stat2 != CUSOLVER_STATUS_SUCCESS) {
       GALOIS_DIE("Failed to initialize cusolver.");
     }
-    stat3 = cudaStreamCreateWithFlags(cusolver_streams.getLocal(), cudaStreamNonBlocking);
+    /*stat3 = cudaStreamCreateWithFlags(cusolver_streams.getLocal(), cudaStreamNonBlocking);
     if (stat3 != cudaSuccess) {
       GALOIS_DIE("Failed to acquire cuda stream.");
     }
     stat2 = cusolverDnSetStream(*cusolver_handles.getLocal(), *cusolver_streams.getLocal());
     if (stat2 != CUSOLVER_STATUS_SUCCESS) {
       GALOIS_DIE("Failed to set stream for cusolver.");
-    }
+    }*/
     stat2 = cusolverDnDpotrf_bufferSize(*cusolver_handles.getLocal(), CUBLAS_FILL_MODE_LOWER, block_size, *b0s.getLocal(), block_size, lwork_sizes.getLocal());
     if (stat2 != cudaSuccess) {
       GALOIS_DIE("Failed to determine lwork size for cusolver dpotrf.");
@@ -418,10 +429,10 @@ int main(int argc, char** argv) {
     if (stat2 != CUSOLVER_STATUS_SUCCESS) {
       GALOIS_DIE("Failed to free cusolver resources.");
     }
-    stat = cudaStreamDestroy(*cusolver_streams.getLocal());
+    /*stat = cudaStreamDestroy(*cusolver_streams.getLocal());
     if (stat != cudaSuccess) {
       GALOIS_DIE("Failed to free cuda stream for cusolver.");
-    }
+    }*/
     auto stat3 = cublasDestroy(*handles.getLocal());
     if (stat3 != CUBLAS_STATUS_SUCCESS) {
       GALOIS_DIE("Failed to free cublas resources.");
