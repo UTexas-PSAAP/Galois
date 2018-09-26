@@ -225,6 +225,7 @@ int main(int argc, char** argv) {
 
   auto spd_manager = generate_symmetric_positive_definite(dim_size, seed);
   auto spd = spd_manager.get();
+  sa::strided_array<double, 2> spd_ar{spd, sa::array_axes<2>({{{dim_size, sizeof(double)}, {dim_size, dim_size * sizeof(double)}}})};
   //std::cout.precision(19);
   //std::cout << "generated input:" << std::endl;
   //print_mat(spd, dim_size, dim_size, dim_size);
@@ -250,9 +251,13 @@ int main(int argc, char** argv) {
   galois::substrate::PerThreadStorage<cusolverDnHandle_t> cusolver_handles(nullptr);
   //galois::substrate::PerThreadStorage<cudaStream_t> cusolver_streams(nullptr);
   galois::substrate::PerThreadStorage<int> lwork_sizes;
+  sa::array_axes<2> block_axes{{{{block_size, sizeof(double)}, {block_size, block_size * sizeof(double)}}}};
   galois::substrate::PerThreadStorage<double*> b0s;
+  galois::substrate::PerThreadStorage<sa::strided_array<double, 2>> b0as{nullptr, block_axes};
   galois::substrate::PerThreadStorage<double*> b1s;
+  galois::substrate::PerThreadStorage<sa::strided_array<double, 2>> b1as{nullptr, block_axes};
   galois::substrate::PerThreadStorage<double*> b2s;
+  galois::substrate::PerThreadStorage<sa::strided_array<double, 2>> b2as{nullptr, block_axes};
   galois::substrate::PerThreadStorage<double*> lworks;
   galois::substrate::PerThreadStorage<int*> dev_infos;
   galois::on_each([&](unsigned int tid, unsigned int nthreads) {
@@ -297,14 +302,17 @@ int main(int argc, char** argv) {
     if (stat3 != cudaSuccess) {
       GALOIS_DIE("Failed to allocate GPU buffers for blocked operations.");
     }
+    b0as.getLocal()->data = *b0s.getLocal();
     stat3 = cudaMalloc(b1s.getLocal(), static_cast<std::size_t>(block_size * block_size * sizeof(double)));
     if (stat3 != cudaSuccess) {
       GALOIS_DIE("Failed to allocate GPU buffers for blocked operations.");
     }
+    b1as.getLocal()->data = *b1s.getLocal();
     stat3 = cudaMalloc(b2s.getLocal(), static_cast<std::size_t>(block_size * block_size * sizeof(double)));
     if (stat3 != cudaSuccess) {
       GALOIS_DIE("Failed to allocate GPU buffers for blocked operations.");
     }
+    b2as.getLocal()->data = *b2s.getLocal();
   });
 
   auto locks = std::make_unique<galois::runtime::Lockable[]>(nblocks * nblocks);
