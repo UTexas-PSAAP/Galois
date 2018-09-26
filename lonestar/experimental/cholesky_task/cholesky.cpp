@@ -21,6 +21,8 @@
 #include "llvm/Support/CommandLine.h"
 #include "Lonestar/BoilerPlate.h"
 
+//#include "strided_array.hpp"
+
 static const char* name = "Task Based Cholesky Factorization";
 static const char* desc = "";
 static const char* url = "cholesky_task";
