@@ -21,7 +21,9 @@
 #include "llvm/Support/CommandLine.h"
 #include "Lonestar/BoilerPlate.h"
 
-//#include "strided_array.hpp"
+#include "strided_array.hpp"
+#include "cuda_unique.hpp"
+#include "cublas_wrappers.hpp"
 
 static const char* name = "Task Based Cholesky Factorization";
 static const char* desc = "";
