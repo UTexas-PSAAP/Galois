@@ -45,35 +45,61 @@ using LMap = std::map<task_label, GNode>;
 void generate_tasks(int nblocks, Graph &g, LMap &label_map) {
   for (std::size_t j = 0; j < nblocks; j++) {
     for (std::size_t k = 0; k < j; k++) {
-      auto n = g.createNode(1, 0, j, k, 1);
-      g.addNode(n);
-      label_map[task_label(0, j, k, 1)] = n;
-      g.addEdge(label_map[task_label(0, j, k, 4)], n);
-    }
-    auto n = g.createNode(j, 0, 0, j, 2);
-    g.addNode(n);
-    label_map[task_label(0, 0, j, 2)] = n;
-    for (std::size_t k = 0; k < j; k++) {
-      g.addEdge(label_map[task_label(0, j, k, 1)], n);
-    }
-    for (std::size_t i = j+1; i < nblocks; i++) {
-      for (std::size_t k = 0; k < j; k++) {
-        auto n = g.createNode(2, i, j, k, 3);
+      if (k == 0) {
+        auto n = g.createNode(1, 0, j, k, 1);
         g.addNode(n);
-        label_map[task_label(i, j, k, 3)] = n;
+        label_map[task_label(0, j, k, 1)] = n;
         g.addEdge(label_map[task_label(0, j, k, 4)], n);
-        g.addEdge(label_map[task_label(0, i, k, 4)], n);
+      } else {
+        auto n = g.createNode(2, 0, j, k, 1);
+        g.addNode(n);
+        label_map[task_label(0, j, k, 1)] = n;
+        g.addEdge(label_map[task_label(0, j, k, 4)], n);
+        g.addEdge(label_map[task_label(0, j, k-1, 1)], n);
       }
-      auto n = g.createNode(j+1, 0, i, j, 4);
+    }
+    if (j == 0) {
+      auto n = g.createNode(0, 0, 0, j, 2);
       g.addNode(n);
-      label_map[task_label(0, i, j, 4)] = n;
-      g.addEdge(label_map[task_label(0, 0, j, 2)], n);
+      label_map[task_label(0, 0, j, 2)] = n;
+    } else {
+      auto n = g.createNode(1, 0, 0, j, 2);
+      g.addNode(n);
+      label_map[task_label(0, 0, j, 2)] = n;
+      g.addEdge(label_map[task_label(0, j, j-1, 1)], n);
+    }
+    for (std::size_t i = j + 1; i < nblocks; i++) {
       for (std::size_t k = 0; k < j; k++) {
-        g.addEdge(label_map[task_label(i, j, k, 3)], n);
+        if (k == 0) {
+          auto n = g.createNode(2, i, j, k, 3);
+          g.addNode(n);
+          label_map[task_label(i, j, k, 3)] = n;
+          g.addEdge(label_map[task_label(0, j, k, 4)], n);
+          g.addEdge(label_map[task_label(0, i, k, 4)], n);
+        } else {
+          auto n = g.createNode(3, i, j, k, 3);
+          g.addNode(n);
+          label_map[task_label(i, j, k, 3)] = n;
+          g.addEdge(label_map[task_label(0, j, k, 4)], n);
+          g.addEdge(label_map[task_label(0, i, k, 4)], n);
+          g.addEdge(label_map[task_label(i, j, k-1, 3)], n);
+        }
+      }
+      if (j == 0) {
+        auto n = g.createNode(1, 0, i, j, 4);
+        g.addNode(n);
+        label_map[task_label(0, i, j, 4)] = n;
+        g.addEdge(label_map[task_label(0, 0, j, 2)], n);
+      } else {
+        auto n = g.createNode(2, 0, i, j, 4);
+        g.addNode(n);
+        label_map[task_label(0, i, j, 4)] = n;
+        g.addEdge(label_map[task_label(0, 0, j, 2)], n);
+        g.addEdge(label_map[task_label(i, j, j-1, 3)], n);
       }
     }
   }
-}
+} 
 
 void print_deps(Graph &g) {
   for (auto n : g) {
@@ -235,7 +261,6 @@ int main(int argc, char** argv) {
   construction_timer.start();
   Graph g;
   LMap label_map;
-  std::mutex map_lock;
   generate_tasks(nblocks, g, label_map);
   construction_timer.stop();
   //print_deps(g);
@@ -315,8 +340,6 @@ int main(int argc, char** argv) {
     b2as.getLocal()->data = *b2s.getLocal();
   });
 
-  auto locks = std::make_unique<galois::runtime::Lockable[]>(nblocks * nblocks);
-
   // Now execute the tasks.
   galois::for_each(
     galois::iterate({label_map[task_label(0, 0, 0, 2)]}),
@@ -326,8 +349,6 @@ int main(int argc, char** argv) {
       if (task_type == 1) {
         auto j = std::get<2>(d);
         auto k = std::get<3>(d);
-        galois::runtime::doAcquire(&(locks.get()[j + nblocks * j]), galois::MethodFlag::WRITE);
-        galois::runtime::doAcquire(&(locks.get()[j + nblocks * k]), galois::MethodFlag::READ);
         auto b0 = *b0s.getLocal();
         auto b1 = *b1s.getLocal();
         auto b2 = *b2s.getLocal();
@@ -349,7 +370,6 @@ int main(int argc, char** argv) {
         data_movement_timer.stop();
       } else if (task_type == 2) {
         auto j = std::get<3>(d);
-        galois::runtime::doAcquire(&(locks.get()[j + nblocks * j]), galois::MethodFlag::WRITE);
         auto b0 = *b0s.getLocal();
         auto lwork = *lworks.getLocal();
         auto lwork_size = *lwork_sizes.getLocal();
@@ -385,9 +405,6 @@ int main(int argc, char** argv) {
         auto i = std::get<1>(d);
         auto j = std::get<2>(d);
         auto k = std::get<3>(d);
-        galois::runtime::doAcquire(&(locks.get()[i + nblocks * j]), galois::MethodFlag::WRITE);
-        galois::runtime::doAcquire(&(locks.get()[i + nblocks * k]), galois::MethodFlag::READ);
-        galois::runtime::doAcquire(&(locks.get()[j + nblocks * k]), galois::MethodFlag::READ);
         auto b0 = *b0s.getLocal();
         auto b1 = *b1s.getLocal();
         auto b2 = *b2s.getLocal();
@@ -412,8 +429,6 @@ int main(int argc, char** argv) {
       } else if (task_type == 4) {
         auto i = std::get<2>(d);
         auto j = std::get<3>(d);
-        galois::runtime::doAcquire(&(locks.get()[j + nblocks * j]), galois::MethodFlag::READ);
-        galois::runtime::doAcquire(&(locks.get()[i + nblocks * j]), galois::MethodFlag::WRITE);
         auto b0 = *b0s.getLocal();
         auto b1 = *b1s.getLocal();
         auto handle = *handles.getLocal();
