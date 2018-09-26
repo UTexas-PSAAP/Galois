@@ -225,11 +225,21 @@ int main(int argc, char** argv) {
   //std::cout << "generated input:" << std::endl;
   //print_mat(spd, dim_size, dim_size, dim_size);
 
+  galois::StatTimer construction_timer{"Task graph construction"};
+
+  construction_timer.start();
   Graph g;
   LMap label_map;
   std::mutex map_lock;
   generate_tasks(nblocks, g, label_map);
+  construction_timer.stop();
   //print_deps(g);
+
+  // Timers to measure the portion of time spent on different portions of the given operator.
+  galois::PerThreadTimer<true> updating_tasks_timer{"cholesky_tasks", "task updates"};
+  galois::PerThreadTimer<true> computation_calls_timer{"cholesky_tasks", "computation calls"};
+  galois::PerThreadTimer<true> data_movement_timer{"cholesky_tasks", "data movement"};
+  galois::StatTimer verification_timer{"Verification of Cholesky decomposition."};
 
   // Now set up the needed resources for each thread.
   galois::substrate::PerThreadStorage<cublasHandle_t> handles(nullptr);
@@ -310,15 +320,21 @@ int main(int argc, char** argv) {
         auto b1 = *b1s.getLocal();
         auto b2 = *b2s.getLocal();
         auto handle = *handles.getLocal();
+        data_movement_timer.start();
         auto stat = cublasSetMatrix(block_size, block_size, sizeof(double), spd + j * block_size + j * block_size * dim_size, dim_size, b0, block_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed. (1)");
         stat = cublasSetMatrix(block_size, block_size, sizeof(double), spd + j * block_size + k * block_size * dim_size, dim_size, b1, block_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed. (2)");
         double alpha = -1., beta = 1.;
+        data_movement_timer.stop();
+        computation_calls_timer.start();
         stat = cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, block_size, block_size, block_size, &alpha, b1, block_size, b1, block_size, &beta, b0, block_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("dgemm operation failed. (3)");
+        computation_calls_timer.stop();
+        data_movement_timer.start();
         stat = cublasGetMatrix(block_size, block_size, sizeof(double), b0, block_size, spd + j * block_size + j * block_size * dim_size, dim_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Recieve from GPU failed. (4)");
+        data_movement_timer.stop();
       } else if (task_type == 2) {
         auto j = std::get<3>(d);
         galois::runtime::doAcquire(&(locks.get()[j + nblocks * j]), galois::MethodFlag::WRITE);
@@ -326,9 +342,12 @@ int main(int argc, char** argv) {
         auto lwork = *lworks.getLocal();
         auto lwork_size = *lwork_sizes.getLocal();
         auto cusolver_handle = *cusolver_handles.getLocal();
+        data_movement_timer.start();
         auto stat = cublasSetMatrix(block_size, block_size, sizeof(double), spd + j * block_size + j * block_size * dim_size, dim_size, b0, block_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed. (5)");
         int info = 0;
+        data_movement_timer.stop();
+        computation_calls_timer.start();
         auto stat2 = cusolverDnDpotrf(cusolver_handle, CUBLAS_FILL_MODE_LOWER, block_size, b0, block_size, lwork, lwork_size, *dev_infos.getLocal());
         if (stat2 != CUSOLVER_STATUS_SUCCESS) GALOIS_DIE("Cholesky block solve failed. (6)");
         auto stat3 = cudaMemcpy(&info, *dev_infos.getLocal(), sizeof(int), cudaMemcpyDeviceToHost);
@@ -345,8 +364,11 @@ int main(int argc, char** argv) {
             GALOIS_DIE(ss.str());
           }
         }
+        computation_calls_timer.stop();
+        data_movement_timer.start();
         stat = cublasGetMatrix(block_size, block_size, sizeof(double), b0, block_size, spd + j * block_size + j * block_size * dim_size, dim_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Recieve from GPU failed. (10)");
+        data_movement_timer.stop();
       } else if (task_type == 3) {
         auto i = std::get<1>(d);
         auto j = std::get<2>(d);
@@ -358,17 +380,23 @@ int main(int argc, char** argv) {
         auto b1 = *b1s.getLocal();
         auto b2 = *b2s.getLocal();
         auto handle = *handles.getLocal();
+        data_movement_timer.start();
         auto stat = cublasSetMatrix(block_size, block_size, sizeof(double), spd + i * block_size + j * block_size * dim_size, dim_size, b0, block_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed. (11)");
         stat = cublasSetMatrix(block_size, block_size, sizeof(double), spd + i * block_size + k * block_size * dim_size, dim_size, b1, block_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed. (12)");
         stat = cublasSetMatrix(block_size, block_size, sizeof(double), spd + j * block_size + k * block_size * dim_size, dim_size, b2, block_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed. (13)");
+        data_movement_timer.stop();
+        computation_calls_timer.start();
         double alpha = -1, beta = 1;
         stat = cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, block_size, block_size, block_size, &alpha, b1, block_size, b2, block_size, &beta, b0, block_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("dgemm operation failed. (14)");
+        computation_calls_timer.stop();
+        data_movement_timer.start();
         stat = cublasGetMatrix(block_size, block_size, sizeof(double), b0, block_size, spd + i * block_size + j * block_size * dim_size, dim_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Recieve from GPU failed. (15)");
+        data_movement_timer.stop();
       } else if (task_type == 4) {
         auto i = std::get<2>(d);
         auto j = std::get<3>(d);
@@ -377,29 +405,74 @@ int main(int argc, char** argv) {
         auto b0 = *b0s.getLocal();
         auto b1 = *b1s.getLocal();
         auto handle = *handles.getLocal();
+        data_movement_timer.start();
         auto stat = cublasSetMatrix(block_size, block_size, sizeof(double), spd + j * block_size + j * block_size * dim_size, dim_size, b0, block_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed. (16)");
         stat = cublasSetMatrix(block_size, block_size, sizeof(double), spd + i * block_size + j * block_size * dim_size, dim_size, b1, block_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed. (17)");
+        data_movement_timer.stop();
+        computation_calls_timer.start();
         double alpha = 1.;
         stat = cublasDtrsm(handle, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT, block_size, block_size, &alpha, b0, block_size, b1, block_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("dtrsm operation failed. (18)");
+        computation_calls_timer.stop();
+        data_movement_timer.start();
         stat = cublasGetMatrix(block_size, block_size, sizeof(double), b1, block_size, spd + i * block_size + j * block_size * dim_size, dim_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Recieve from GPU failed. (19)");
+        data_movement_timer.stop();
       } else {
         GALOIS_DIE("Unrecognized task type.");
       }
 
+      updating_tasks_timer.start();
       for (auto e : g.edges(n, galois::MethodFlag::UNPROTECTED)) {
         auto dst = g.getEdgeDst(e);
         if (0 == --std::get<0>(g.getData(dst, galois::MethodFlag::UNPROTECTED))) {
           ctx.push(dst);
         }
       }
+      updating_tasks_timer.stop();
     },
     galois::loopname("cholesky_tasks"), galois::wl<PSChunk>()
   );
-
+  {
+    auto spd2_manager = generate_symmetric_positive_definite(dim_size, seed);
+    auto spd2 = spd2_manager.get();
+    galois::StatTimer cusolver_dpotrf_timer{"cusolver dpotrf time"};
+    int info;
+    double *dev_spd2;
+    auto stat = cudaMalloc(&dev_spd2, dim_size * dim_size * sizeof(double));
+    if (stat != cudaSuccess) {
+      GALOIS_DIE("Failed to allocate GPU buffers for fully on-device cholesky.");
+    }
+    auto stat2 = cublasSetMatrix(dim_size, dim_size, sizeof(double), spd2, dim_size, dev_spd2, dim_size);
+    if (stat2 != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed.");
+    int work_size;
+    auto stat3 = cusolverDnDpotrf_bufferSize(*cusolver_handles.getLocal(), CUBLAS_FILL_MODE_LOWER, dim_size, dev_spd2, dim_size, &work_size);
+    if (stat3 != CUSOLVER_STATUS_SUCCESS) GALOIS_DIE("Could not get work size for cusolver dpotrf.");
+    double *work;
+    stat = cudaMalloc(&work, work_size * sizeof(double));
+    if (stat != cudaSuccess) GALOIS_DIE("Failed to allocate gpu work buffer");
+    cusolver_dpotrf_timer.start();
+    stat3 = cusolverDnDpotrf(*cusolver_handles.getLocal(), CUBLAS_FILL_MODE_LOWER, dim_size, dev_spd2, dim_size, work, work_size, *dev_infos.getLocal());
+    if (stat3 != CUSOLVER_STATUS_SUCCESS) GALOIS_DIE("Cholesky block solve failed.");
+    stat = cudaMemcpy(&info, *dev_infos.getLocal(), sizeof(int), cudaMemcpyDeviceToHost);
+    if (stat != cudaSuccess) GALOIS_DIE("Recieve status after Cholesky on block failed. (7)");
+    if (info != 0) {
+      std::cout << info << std::endl;
+      std::stringstream ss;
+      if (info < 0) {
+        ss << "Parameter " << -info << " incorrect when passed to dpotrf.";
+        GALOIS_DIE(ss.str());
+      }
+      if (info > 0) {
+        ss << "Not positive definite at minor " << info << " during per-block Cholesky computation.";
+        GALOIS_DIE(ss.str());
+      }
+    }
+    cusolver_dpotrf_timer.stop();
+  }
+  
   //std::cout << "result:" << std::endl;
   //print_mat(spd, dim_size, dim_size, dim_size);
 
@@ -443,7 +516,9 @@ int main(int argc, char** argv) {
     }
   });
 
+  verification_timer.start();
   check_correctness(spd, dim_size, seed, tolerance);
+  verification_timer.stop();
   
   return 0;
 }
