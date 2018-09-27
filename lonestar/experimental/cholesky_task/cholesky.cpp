@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <fstream>
 #include <mutex>
 #include <random>
 #include <tuple>
@@ -33,6 +34,7 @@ static llvm::cl::opt<int> dim_size("dim_size", llvm::cl::desc("Number of rows/co
 static llvm::cl::opt<int> block_size("block_size", llvm::cl::desc("Number of rows/columns in each block."), llvm::cl::init(3));
 static llvm::cl::opt<int> seed("seed", llvm::cl::desc("Seed used to generate symmetric positive definite matrix."), llvm::cl::init(0));
 static llvm::cl::opt<double> tolerance("tolerance", llvm::cl::desc("Tolerance used to check that the results are correct."), llvm::cl::init(.001));
+static llvm::cl::opt<std::string> dependence_outfile("dependence_outfile", llvm::cl::desc("Write the dependence graph to the given file (in .dot format)."), llvm::cl::init(""));
 
 using task_data = std::tuple<std::atomic<std::size_t>, int, int, int, char>;
 using task_label = std::tuple<int, int, int, char>;
@@ -110,6 +112,39 @@ void print_deps(Graph &g) {
       std::cout << "    " << int(std::get<4>(a)) << "(" << std::get<1>(a) << ", " << std::get<2>(a) << ", " << std::get<3>(a) << ")" << std::endl;
     }
   }
+}
+
+std::string task_to_str(task_data &t) {
+  std::stringstream ss;
+  int type = std::get<4>(t);
+  ss << "T" << type << "(";
+  if (type == 1 || type == 4) {
+    ss << std::get<2>(t) << ", " << std::get<3>(t) << ")";
+  } else if (type == 2) {
+    ss << std::get<3>(t) << ")";
+  } else if (type == 3) {
+    ss << std::get<1>(t) << ", " << std::get<2>(t) << ", " << std::get<3>(t) << ")";
+  } else {
+    // Invalid task type
+    assert(false);
+  }
+  return ss.str();
+}
+
+void write_dependences(Graph &g, std::string fname) {
+  // TODO: RAII for this would be better!
+  std::ofstream f;
+  f.open(fname);
+  f << "digraph cholesky_deps {\n";
+  for (auto n : g) {
+    auto &d = g.getData(n);
+    for (auto e : g.edges(n)) {
+      auto &a = g.getData(g.getEdgeDst(e));
+      f << "    \"" << task_to_str(d) << "\" -> \"" << task_to_str(a) << "\";\n";
+    }
+  }
+  f << "}\n";
+  f.close();
 }
 
 decltype(auto) generate_symmetric_positive_definite(std::size_t size, std::size_t seed) {
@@ -265,6 +300,9 @@ int main(int argc, char** argv) {
   generate_tasks(nblocks, g, label_map);
   construction_timer.stop();
   //print_deps(g);
+  if (dependence_outfile != "") {
+    write_dependences(g, dependence_outfile);
+  }
 
   // Timers to measure the portion of time spent on different portions of the given operator.
   galois::PerThreadTimer<true> updating_tasks_timer{"cholesky_tasks", "task updates"};
