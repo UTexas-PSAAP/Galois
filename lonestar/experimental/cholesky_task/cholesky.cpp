@@ -45,59 +45,52 @@ using GNode = Graph::GraphNode;
 using LMap = std::map<task_label, GNode>;
 
 void generate_tasks(int nblocks, Graph &g, LMap &label_map) {
+  auto register_task = [&](int tp, int i0, int i1, int i2, int count) {
+    auto n = g.createNode(count, i0, i1, i2, tp);
+    g.addNode(n);
+    label_map[task_label(i0, i1, i2, tp)] = n;
+    return n;
+  };
+  auto add_dep = [&](GNode n, int tp, int i0, int i1, int i2) {
+    g.addEdge(label_map[task_label(i0, i1, i2, tp)], n);
+  };
   for (std::size_t j = 0; j < nblocks; j++) {
     for (std::size_t k = 0; k < j; k++) {
       if (k == 0) {
-        auto n = g.createNode(1, 0, j, k, 1);
-        g.addNode(n);
-        label_map[task_label(0, j, k, 1)] = n;
-        g.addEdge(label_map[task_label(0, j, k, 4)], n);
+        auto n = register_task(1, 0, j, k, 1);
+        add_dep(n, 4, 0, j, k);
       } else {
-        auto n = g.createNode(2, 0, j, k, 1);
-        g.addNode(n);
-        label_map[task_label(0, j, k, 1)] = n;
-        g.addEdge(label_map[task_label(0, j, k, 4)], n);
-        g.addEdge(label_map[task_label(0, j, k-1, 1)], n);
+        auto n = register_task(1, 0, j, k, 2);
+        add_dep(n, 4, 0, j, k);
+        add_dep(n, 1, 0, j, k-1);
       }
     }
     if (j == 0) {
-      auto n = g.createNode(0, 0, 0, j, 2);
-      g.addNode(n);
-      label_map[task_label(0, 0, j, 2)] = n;
+      auto n = register_task(2, 0, 0, j, 0);
     } else {
-      auto n = g.createNode(1, 0, 0, j, 2);
-      g.addNode(n);
-      label_map[task_label(0, 0, j, 2)] = n;
-      g.addEdge(label_map[task_label(0, j, j-1, 1)], n);
+      auto n = register_task(2, 0, 0, j, 1);
+      add_dep(n, 1, 0, j, j-1);
     }
     for (std::size_t i = j + 1; i < nblocks; i++) {
       for (std::size_t k = 0; k < j; k++) {
         if (k == 0) {
-          auto n = g.createNode(2, i, j, k, 3);
-          g.addNode(n);
-          label_map[task_label(i, j, k, 3)] = n;
-          g.addEdge(label_map[task_label(0, j, k, 4)], n);
-          g.addEdge(label_map[task_label(0, i, k, 4)], n);
+          auto n = register_task(3, i, j, k, 2);
+          add_dep(n, 4, 0, j, k);
+          add_dep(n, 4, 0, i, k);
         } else {
-          auto n = g.createNode(3, i, j, k, 3);
-          g.addNode(n);
-          label_map[task_label(i, j, k, 3)] = n;
-          g.addEdge(label_map[task_label(0, j, k, 4)], n);
-          g.addEdge(label_map[task_label(0, i, k, 4)], n);
-          g.addEdge(label_map[task_label(i, j, k-1, 3)], n);
+          auto n = register_task(3, i, j, k, 3);
+          add_dep(n, 4, 0, j, k);
+          add_dep(n, 4, 0, i, k);
+          add_dep(n, 3, i, j, k-1);
         }
       }
       if (j == 0) {
-        auto n = g.createNode(1, 0, i, j, 4);
-        g.addNode(n);
-        label_map[task_label(0, i, j, 4)] = n;
-        g.addEdge(label_map[task_label(0, 0, j, 2)], n);
+        auto n = register_task(4, 0, i, j, 1);
+        add_dep(n, 2, 0, 0, j);
       } else {
-        auto n = g.createNode(2, 0, i, j, 4);
-        g.addNode(n);
-        label_map[task_label(0, i, j, 4)] = n;
-        g.addEdge(label_map[task_label(0, 0, j, 2)], n);
-        g.addEdge(label_map[task_label(i, j, j-1, 3)], n);
+        auto n = register_task(4, 0, i, j, 2);
+        add_dep(n, 2, 0, 0, j);
+        add_dep(n, 3, i, j, j-1);
       }
     }
   }
