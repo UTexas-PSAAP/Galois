@@ -32,6 +32,8 @@ static const char* url = "cholesky_task";
 
 static llvm::cl::opt<int> dim_size("dim_size", llvm::cl::desc("Number of rows/columns in main matrix."), llvm::cl::init(9));
 static llvm::cl::opt<int> block_size("block_size", llvm::cl::desc("Number of rows/columns in each block."), llvm::cl::init(3));
+static llvm::cl::opt<unsigned int> max_queue_size("max_queue_size", llvm::cl::desc("Maximum number of tasks in task queue"), llvm::cl::init(100));
+static llvm::cl::opt<unsigned int> min_queue_size("min_queue_size", llvm::cl::desc("Threshold for generating more tasks in the task queue"), llvm::cl::init(30));
 static llvm::cl::opt<int> seed("seed", llvm::cl::desc("Seed used to generate symmetric positive definite matrix."), llvm::cl::init(0));
 static llvm::cl::opt<double> tolerance("tolerance", llvm::cl::desc("Tolerance used to check that the results are correct."), llvm::cl::init(.001));
 static llvm::cl::opt<std::string> dependence_outfile("dependence_outfile", llvm::cl::desc("Write the dependence graph to the given file (in .dot format)."), llvm::cl::init(""));
@@ -39,15 +41,64 @@ static llvm::cl::opt<std::string> dependence_outfile("dependence_outfile", llvm:
 using task_data = std::tuple<std::atomic<std::size_t>, int, int, int, char>;
 using task_label = std::tuple<int, int, int, char>;
 
+task_label data_to_label(task_data &d) noexcept {
+  return std::make_tuple(std::get<1>(d), std::get<2>(d), std::get<3>(d), std::get<4>(d));
+}
+
 // Use Morph_Graph to get this up and running quickly.
 using Graph = galois::graphs::MorphGraph<task_data, void, true>;
 using GNode = Graph::GraphNode;
 using LMap = std::map<task_label, GNode>;
 
+void print_deps(Graph &g) {
+  for (auto n : g) {
+    auto &d = g.getData(n);
+    std::cout << int(std::get<4>(d)) << "(" << std::get<1>(d) << ", " << std::get<2>(d) << ", " << std::get<3>(d) << "):" << std::endl;
+    for (auto e : g.edges(n)) {
+      auto &a = g.getData(g.getEdgeDst(e));
+      std::cout << "    " << int(std::get<4>(a)) << "(" << std::get<1>(a) << ", " << std::get<2>(a) << ", " << std::get<3>(a) << ")" << std::endl;
+    }
+  }
+}
+
+std::string task_to_str(task_data &t) {
+  std::stringstream ss;
+  int type = std::get<4>(t);
+  ss << "T" << type << "(";
+  if (type == 1 || type == 4) {
+    ss << std::get<2>(t) << ", " << std::get<3>(t) << ")";
+  } else if (type == 2) {
+    ss << std::get<3>(t) << ")";
+  } else if (type == 3) {
+    ss << std::get<1>(t) << ", " << std::get<2>(t) << ", " << std::get<3>(t) << ")";
+  } else {
+    // Invalid task type
+    assert(false);
+    }
+    return ss.str();
+    }
+
+void write_dependences(Graph &g, std::string fname) {
+  // TODO: RAII for this would be better!
+  std::ofstream f;
+  f.open(fname);
+  f << "digraph cholesky_deps {\n";
+  for (auto n : g) {
+    auto &d = g.getData(n);
+    for (auto e : g.edges(n)) {
+      auto &a = g.getData(g.getEdgeDst(e));
+      f << "    \"" << task_to_str(d) << "\" -> \"" << task_to_str(a) << "\";\n";
+    }
+  }
+  f << "}\n";
+  f.close();
+}
+
 void generate_tasks(int nblocks, Graph &g, LMap &label_map) {
   auto register_task = [&](int tp, int i0, int i1, int i2, int count) {
     auto n = g.createNode(count, i0, i1, i2, tp);
     g.addNode(n);
+    task_label dep{i0, i1, i2, tp};
     label_map[task_label(i0, i1, i2, tp)] = n;
     return n;
   };
@@ -96,49 +147,147 @@ void generate_tasks(int nblocks, Graph &g, LMap &label_map) {
   }
 } 
 
-void print_deps(Graph &g) {
-  for (auto n : g) {
-    auto &d = g.getData(n);
-    std::cout << int(std::get<4>(d)) << "(" << std::get<1>(d) << ", " << std::get<2>(d) << ", " << std::get<3>(d) << "):" << std::endl;
-    for (auto e : g.edges(n)) {
-      auto &a = g.getData(g.getEdgeDst(e));
-      std::cout << "    " << int(std::get<4>(a)) << "(" << std::get<1>(a) << ", " << std::get<2>(a) << ", " << std::get<3>(a) << ")" << std::endl;
+struct task_generator {
+  Graph &graph;
+  LMap &label_map;
+  int num_blocks;
+  int j = 0;
+  int i = 1;
+  int k = 0;
+  int task_type = 0;
+  std::atomic<bool> finished = false;
+
+  task_generator(Graph &g, LMap &l, int nb): graph(g), label_map(l), num_blocks(nb) {}
+
+  task_generator() = delete;
+  task_generator(task_generator&) = delete;
+  task_generator(task_generator&&) = delete;
+  task_generator &operator=(task_generator&) = delete;
+  task_generator &operator=(task_generator&&) = delete;
+
+private:
+  int num_deps() noexcept {
+    if (task_type == 1) return k == 0 ? 1 : 2;
+    if (task_type == 2) return j == 0 ? 0 : 1;
+    if (task_type == 3) return k == 0 ? 2 : 3;
+    if (task_type == 4) return j == 0 ? 1 : 2;
+    std::abort();
+  }
+
+  auto create_current() noexcept {
+    auto create = [&](int tp, int i0, int i1, int i2, int count) {
+      auto n = graph.createNode(count, i0, i1, i2, tp);
+      graph.addNode(n);
+      label_map[task_label(i0, i1, i2, tp)] = n;
+      return n;
+    };
+    // TODO Fix the "leading by 0" convention so branching like
+    // this isn't necessary.
+    if (task_type == 1) return create(1, 0, j, k, num_deps());
+    if (task_type == 2) return create(2, 0, 0, j, num_deps());
+    if (task_type == 3) return create(3, i, j, k, num_deps());
+    if (task_type == 4) return create(4, 0, i, j, num_deps());
+    std::abort();
+  }
+
+  void add_deps(auto node, auto &context) noexcept {
+    auto add_dep = [&](GNode n, int tp, int i0, int i1, int i2) {
+      auto dependency_label = task_label(i0, i1, i2, tp);
+      if (label_map.count(dependency_label)) {
+        graph.addEdge(label_map[dependency_label], n);
+      } else {
+        // If the node isn't there, then it's completed already.
+        std::get<0>(graph.getData(n))--;
+      }
+    };
+    if (task_type == 1) {
+      add_dep(node, 4, 0, j, k);
+      if (k > 0) add_dep(node, 1, 0, j, k-1);
+    } else if (task_type == 2) {
+      if (j > 0) add_dep(node, 1, 0, j, j-1);
+    } else if (task_type == 3) {
+      add_dep(node, 4, 0, j, k);
+      add_dep(node, 4, 0, i, k);
+      if (k > 0) add_dep(node, 3, i, j, k-1);
+    } else if (task_type == 4) {
+      add_dep(node, 2, 0, 0, j);
+      if (j > 0) add_dep(node, 3, i, j, j-1);
+    } else {
+      std::abort();
+    }
+    // Push the work to the list of ready tasks if all
+    // its dependencies have finished.
+    if (std::get<0>(graph.getData(node)) == 0) context.push(node);
+  }
+
+  auto register_current(auto &context) noexcept {
+    auto n = create_current();
+    add_deps(n, context);
+  }
+
+  void advance() noexcept {
+    if (task_type == 0 && !finished) {
+      task_type = 2;
+    }else if (task_type == 1) {
+      if (k + 1 < j) {
+        k++;
+      } else {
+        k = 0;
+        task_type = 2;
+      }
+    } else if (task_type == 2) {
+      if (j > 0) {
+        if (j + 1 < num_blocks) {
+          task_type = 3;
+        } else {
+          // Advance after finished iteration.
+          std::abort();
+        }
+      } else {
+        task_type = 4;
+      }
+    } else if (task_type == 3) {
+      if (k + 1 < j) {
+        k++;
+      } else {
+        k = 0;
+        task_type = 4;
+      }
+    } else if (task_type == 4) {
+      if (i + 1 < num_blocks) {
+        i++;
+        if (j > 0) {
+          task_type = 3;
+        } else {
+          task_type = 4;
+        }
+      } else {
+        j++;
+        i = j + 1;
+        task_type = 1;
+      }
     }
   }
-}
 
-std::string task_to_str(task_data &t) {
-  std::stringstream ss;
-  int type = std::get<4>(t);
-  ss << "T" << type << "(";
-  if (type == 1 || type == 4) {
-    ss << std::get<2>(t) << ", " << std::get<3>(t) << ")";
-  } else if (type == 2) {
-    ss << std::get<3>(t) << ")";
-  } else if (type == 3) {
-    ss << std::get<1>(t) << ", " << std::get<2>(t) << ", " << std::get<3>(t) << ")";
-  } else {
-    // Invalid task type
-    assert(false);
+  void register_next(auto &context) noexcept {
+    advance();
+    register_current(context);
+    if (task_type == 2 && j + 1 == num_blocks) finished = true;
   }
-  return ss.str();
-}
 
-void write_dependences(Graph &g, std::string fname) {
-  // TODO: RAII for this would be better!
-  std::ofstream f;
-  f.open(fname);
-  f << "digraph cholesky_deps {\n";
-  for (auto n : g) {
-    auto &d = g.getData(n);
-    for (auto e : g.edges(n)) {
-      auto &a = g.getData(g.getEdgeDst(e));
-      f << "    \"" << task_to_str(d) << "\" -> \"" << task_to_str(a) << "\";\n";
+public:
+
+  void print_state() noexcept {
+    std::cout << task_type << "(" << i << ", " << j << ", " << k << ")" << std::endl;
+  }
+
+  void expand_new_tasks(std::size_t min_size, std::size_t max_size, auto &context, std::unique_lock<std::mutex> && graph_lock) noexcept {
+    if (graph.size() >= min_size) return;
+    while (graph.size() < max_size && !finished) {
+      register_next(context);
     }
   }
-  f << "}\n";
-  f.close();
-}
+};
 
 decltype(auto) generate_symmetric_positive_definite(std::size_t size, std::size_t seed) {
   auto tmp = std::make_unique<double[]>(size * size);
@@ -285,15 +434,30 @@ int main(int argc, char** argv) {
   //std::cout << "generated input:" << std::endl;
   //print_mat(spd, dim_size, dim_size, dim_size);
 
-  galois::StatTimer construction_timer{"Task graph construction"};
+  //galois::StatTimer construction_timer{"Task graph construction"};
 
-  construction_timer.start();
+  //construction_timer.start();
   Graph g;
   LMap label_map;
-  generate_tasks(nblocks, g, label_map);
-  construction_timer.stop();
+  // Coarse-grained lock to limit access to the graph and label map.
+  // This is needed because we don't want the Galois loop to abort
+  // when acquiring locks to delete nodes after a task completes.
+  // Note! If there were a thread-safe way to check the number of nodes in
+  // a graph, this would probably not be necessary.
+  std::mutex graph_lock;
+  auto generator = task_generator(g, label_map, nblocks);
+  // Use an all zeros node to denote the "start generating" task.
+  auto init_node = g.createNode(0, 0, 0, 0, 0);
+  g.addNode(init_node);
+  //generate_tasks(nblocks, g, label_map);
+  //construction_timer.stop();
   //print_deps(g);
   if (dependence_outfile != "") {
+    // Use the non-lazy generation code to write the dependency
+    // information to the desired file.
+    Graph g2;
+    LMap label_map_2;
+    generate_tasks(nblocks, g2, label_map_2);
     write_dependences(g, dependence_outfile);
   }
 
@@ -363,9 +527,11 @@ int main(int argc, char** argv) {
     b2as.getLocal()->data = *b2s.getLocal();
   });
 
+  std::atomic<int> counter{0};
+
   // Now execute the tasks.
   galois::for_each(
-    galois::iterate({label_map[task_label(0, 0, 0, 2)]}),
+    galois::iterate({init_node}),
     [&](GNode n, auto& ctx) {
       auto &d = g.getData(n);
       auto task_type = std::get<4>(d);
@@ -480,7 +646,9 @@ int main(int argc, char** argv) {
         stat = cublasGetMatrix(block_size, block_size, sizeof(double), b1, block_size, spd + i * block_size + j * block_size * dim_size, dim_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Recieve from GPU failed. (19)");
         data_movement_timer.stop();
-      } else {
+      } else if (task_type != 0) {
+        // Task type 0 signals to jump ahead to generation.
+        // Otherwise, something has gone terribly wrong.
         GALOIS_DIE("Unrecognized task type.");
       }
 
@@ -491,6 +659,13 @@ int main(int argc, char** argv) {
           ctx.push(dst);
         }
       }
+
+      // Now remove this node entirely.
+      g.removeNode(n);
+      std::unique_lock graph_lock_handle{graph_lock};
+      // Lock covers the map from labels to nodes too, so remove it after qcquiring the lock.
+      label_map.erase(data_to_label(d));
+      generator.expand_new_tasks(min_queue_size, max_queue_size, ctx, std::move(graph_lock_handle));
       updating_tasks_timer.stop();
     },
     galois::loopname("cholesky_tasks"), galois::wl<PSChunk>()
