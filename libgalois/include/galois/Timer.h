@@ -202,7 +202,7 @@ protected:
     on_each([&] (auto a, auto b) {
       auto ns = timers.getLocal()->get_nsec();
       auto lag = ns - minTime;
-      assert(lag > 0 && "negative time lag from min is impossible");
+      assert(lag >= 0 && "negative time lag from min is impossible");
 
       galois::runtime::reportStat_Tmax(region, timeCat.c_str(), ns / 1000000);
       galois::runtime::reportStat_Tmax(region, lagCat.c_str(), lag / 1000000);
