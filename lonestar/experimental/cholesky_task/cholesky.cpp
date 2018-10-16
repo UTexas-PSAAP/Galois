@@ -38,45 +38,55 @@ static llvm::cl::opt<int> seed("seed", llvm::cl::desc("Seed used to generate sym
 static llvm::cl::opt<double> tolerance("tolerance", llvm::cl::desc("Tolerance used to check that the results are correct."), llvm::cl::init(.001));
 static llvm::cl::opt<std::string> dependence_outfile("dependence_outfile", llvm::cl::desc("Write the dependence graph to the given file (in .dot format)."), llvm::cl::init(""));
 
-using task_data = std::tuple<std::atomic<std::size_t>, int, int, int, char>;
+//using task_data = std::tuple<std::atomic<std::size_t>, int, int, int, char>;
 using task_label = std::tuple<int, int, int, char>;
 
-task_label data_to_label(task_data &d) noexcept {
-  return std::make_tuple(std::get<1>(d), std::get<2>(d), std::get<3>(d), std::get<4>(d));
-}
+struct task_data : task_label {
+  task_label label;
+  std::atomic<std::size_t> waiting_on;
+
+  task_data() = delete;
+  task_data(task_data&) = delete;
+  task_data(task_data&&) = delete;
+  task_data &operator=(task_data&) = delete;
+  task_data &operator=(task_data&&) = delete;
+
+  task_data(std::size_t waiting, task_label lbl) noexcept: label(lbl), waiting_on(waiting) {}
+  task_data(char tsk, std::array<int, 3> ind, std::size_t waiting) noexcept: label(ind[0], ind[1], ind[2], tsk), waiting_on(waiting) {}
+};
 
 // Use Morph_Graph to get this up and running quickly.
-using Graph = galois::graphs::MorphGraph<task_data, void, true>;
+using Graph = galois::graphs::MorphGraph<task_data, void, true>::with_no_lockable<true>::type;
 using GNode = Graph::GraphNode;
 using LMap = std::map<task_label, GNode>;
 
 void print_deps(Graph &g) {
   for (auto n : g) {
-    auto &d = g.getData(n);
-    std::cout << int(std::get<4>(d)) << "(" << std::get<1>(d) << ", " << std::get<2>(d) << ", " << std::get<3>(d) << "):" << std::endl;
+    auto &l = g.getData(n).label;
+    std::cout << int(std::get<3>(l)) << "(" << std::get<0>(l) << ", " << std::get<1>(l) << ", " << std::get<2>(l) << "):" << std::endl;
     for (auto e : g.edges(n)) {
       auto &a = g.getData(g.getEdgeDst(e));
-      std::cout << "    " << int(std::get<4>(a)) << "(" << std::get<1>(a) << ", " << std::get<2>(a) << ", " << std::get<3>(a) << ")" << std::endl;
+      std::cout << "    " << int(std::get<3>(a)) << "(" << std::get<0>(a) << ", " << std::get<1>(a) << ", " << std::get<2>(a) << ")" << std::endl;
     }
   }
 }
 
 std::string task_to_str(task_data &t) {
   std::stringstream ss;
-  int type = std::get<4>(t);
+  int type = std::get<3>(t.label);
   ss << "T" << type << "(";
   if (type == 1 || type == 4) {
-    ss << std::get<2>(t) << ", " << std::get<3>(t) << ")";
+    ss << std::get<1>(t.label) << ", " << std::get<2>(t.label) << ")";
   } else if (type == 2) {
-    ss << std::get<3>(t) << ")";
+    ss << std::get<2>(t.label) << ")";
   } else if (type == 3) {
-    ss << std::get<1>(t) << ", " << std::get<2>(t) << ", " << std::get<3>(t) << ")";
+    ss << std::get<0>(t.label) << ", " << std::get<1>(t.label) << ", " << std::get<2>(t.label) << ")";
   } else {
     // Invalid task type
     assert(false);
-    }
-    return ss.str();
-    }
+  }
+  return ss.str();
+}
 
 void write_dependences(Graph &g, std::string fname) {
   // TODO: RAII for this would be better!
@@ -96,7 +106,7 @@ void write_dependences(Graph &g, std::string fname) {
 
 void generate_tasks(int nblocks, Graph &g, LMap &label_map) {
   auto register_task = [&](int tp, int i0, int i1, int i2, int count) {
-    auto n = g.createNode(count, i0, i1, i2, tp);
+    auto n = g.createNode(count, task_label(i0, i1, i2, tp));
     g.addNode(n);
     task_label dep{i0, i1, i2, tp};
     label_map[task_label(i0, i1, i2, tp)] = n;
@@ -145,6 +155,102 @@ void generate_tasks(int nblocks, Graph &g, LMap &label_map) {
       }
     }
   }
+}
+
+void generate_tasks_lazy(int nblocks, std::size_t min_size, std::size_t max_size, Graph &g, LMap &label_map, std::mutex &map_lock, auto &ctx, std::atomic<std::size_t> &graph_size, std::condition_variable &condition, std::mutex &condition_mutex) {
+  std::size_t most_recent_read_size = graph_size;
+  std::size_t est_current_size = most_recent_read_size;
+  auto sleep_on_size = [&]() {
+    if (est_current_size < max_size) {
+      est_current_size++;
+      return;
+    } else {
+      ctx.send_work();
+      most_recent_read_size = (graph_size += (est_current_size - most_recent_read_size));
+      if (most_recent_read_size < min_size) {
+        est_current_size = most_recent_read_size;
+      } else {
+        std::unique_lock<std::mutex> lk{condition_mutex};
+        condition.wait(lk,
+          [&](){return (most_recent_read_size = graph_size) < min_size;}
+        );
+        est_current_size = most_recent_read_size;
+      }
+    }
+  };
+  auto register_task = [&](int tp, int i0, int i1, int i2, int count) {
+    auto n = g.createNode(count, task_label(i0, i1, i2, tp));
+    g.addNode(n);
+    task_label dep{i0, i1, i2, tp};
+    {
+      std::unique_lock<std::mutex> lk{map_lock};
+      label_map[task_label(i0, i1, i2, tp)] = n;
+    }
+    return n;
+  };
+  auto add_dep = [&](GNode n, int tp, int i0, int i1, int i2) {
+    task_label dep{i0, i1, i2, tp};
+    {
+      std::unique_lock<std::mutex> lk{map_lock};
+      if (label_map.count(dep)) {
+        g.addEdge(label_map[task_label(i0, i1, i2, tp)], n);
+      } else {
+        if ((g.getData(n).waiting_on--) == 0) {
+          ctx.push(n);
+        }
+      }
+    }
+  };
+  for (std::size_t j = 0; j < nblocks; j++) {
+    for (std::size_t k = 0; k < j; k++) {
+      if (k == 0) {
+        auto n = register_task(1, 0, j, k, 1);
+        add_dep(n, 4, 0, j, k);
+        sleep_on_size();
+      } else {
+        auto n = register_task(1, 0, j, k, 2);
+        add_dep(n, 4, 0, j, k);
+        add_dep(n, 1, 0, j, k-1);
+        sleep_on_size();
+      }
+    }
+    if (j == 0) {
+      auto n = register_task(2, 0, 0, j, 0);
+      ctx.push(n);
+      sleep_on_size();
+    } else {
+      auto n = register_task(2, 0, 0, j, 1);
+      add_dep(n, 1, 0, j, j-1);
+      sleep_on_size();
+    }
+    for (std::size_t i = j + 1; i < nblocks; i++) {
+      for (std::size_t k = 0; k < j; k++) {
+        if (k == 0) {
+          auto n = register_task(3, i, j, k, 2);
+          add_dep(n, 4, 0, j, k);
+          add_dep(n, 4, 0, i, k);
+          sleep_on_size();
+        } else {
+          auto n = register_task(3, i, j, k, 3);
+          add_dep(n, 4, 0, j, k);
+          add_dep(n, 4, 0, i, k);
+          add_dep(n, 3, i, j, k-1);
+          sleep_on_size();
+        }
+      }
+      if (j == 0) {
+        auto n = register_task(4, 0, i, j, 1);
+        add_dep(n, 2, 0, 0, j);
+        sleep_on_size();
+      } else {
+        auto n = register_task(4, 0, i, j, 2);
+        add_dep(n, 2, 0, 0, j);
+        add_dep(n, 3, i, j, j-1);
+        sleep_on_size();
+      }
+    }
+  }
+  ctx.send_work();
 } 
 
 struct task_generator {
@@ -176,7 +282,7 @@ private:
 
   auto create_current() noexcept {
     auto create = [&](int tp, int i0, int i1, int i2, int count) {
-      auto n = graph.createNode(count, i0, i1, i2, tp);
+      auto n = graph.createNode(count, task_label(i0, i1, i2, tp));
       graph.addNode(n);
       label_map[task_label(i0, i1, i2, tp)] = n;
       return n;
@@ -197,7 +303,7 @@ private:
         graph.addEdge(label_map[dependency_label], n);
       } else {
         // If the node isn't there, then it's completed already.
-        std::get<0>(graph.getData(n))--;
+        graph.getData(n).waiting_on--;
       }
     };
     if (task_type == 1) {
@@ -217,7 +323,7 @@ private:
     }
     // Push the work to the list of ready tasks if all
     // its dependencies have finished.
-    if (std::get<0>(graph.getData(node)) == 0) context.push(node);
+    if (graph.getData(node).waiting_on == 0) context.push(node);
   }
 
   auto register_current(auto &context) noexcept {
@@ -438,16 +544,17 @@ int main(int argc, char** argv) {
 
   //construction_timer.start();
   Graph g;
+  // Use an atomic to track (approximately) the graph size separately.
+  // Don't include the "generate tasks" node in this count.
+  std::atomic<std::size_t> graph_size = 0;
   LMap label_map;
-  // Coarse-grained lock to limit access to the graph and label map.
-  // This is needed because we don't want the Galois loop to abort
-  // when acquiring locks to delete nodes after a task completes.
-  // Note! If there were a thread-safe way to check the number of nodes in
-  // a graph, this would probably not be necessary.
-  std::mutex graph_lock;
-  auto generator = task_generator(g, label_map, nblocks);
+  // Coarse-grained lock to limit access to the label map.
+  std::mutex map_lock;
+  std::condition_variable resume_generation_condition;
+  std::mutex condition_lock;
+  //auto generator = task_generator(g, label_map, nblocks);
   // Use an all zeros node to denote the "start generating" task.
-  auto init_node = g.createNode(0, 0, 0, 0, 0);
+  auto init_node = g.createNode(0, task_label(0, 0, 0, 0));
   g.addNode(init_node);
   //generate_tasks(nblocks, g, label_map);
   //construction_timer.stop();
@@ -534,10 +641,10 @@ int main(int argc, char** argv) {
     galois::iterate({init_node}),
     [&](GNode n, auto& ctx) {
       auto &d = g.getData(n);
-      auto task_type = std::get<4>(d);
+      auto task_type = std::get<3>(d.label);
       if (task_type == 1) {
-        auto j = std::get<2>(d);
-        auto k = std::get<3>(d);
+        auto j = std::get<1>(d.label);
+        auto k = std::get<2>(d.label);
         auto &b0a = *b0as.getLocal();
         auto &b1a = *b1as.getLocal();
         auto &ctx = *cublas_contexts.getLocal();
@@ -561,7 +668,7 @@ int main(int argc, char** argv) {
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("recieve failed.");
         data_movement_timer.stop();
       } else if (task_type == 2) {
-        auto j = std::get<3>(d);
+        auto j = std::get<2>(d.label);
         auto b0 = *b0s.getLocal();
         auto lwork = *lworks.getLocal();
         auto lwork_size = *lwork_sizes.getLocal();
@@ -595,9 +702,9 @@ int main(int argc, char** argv) {
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Recieve from GPU failed. (10)");
         data_movement_timer.stop();
       } else if (task_type == 3) {
-        auto i = std::get<1>(d);
-        auto j = std::get<2>(d);
-        auto k = std::get<3>(d);
+        auto i = std::get<0>(d.label);
+        auto j = std::get<1>(d.label);
+        auto k = std::get<2>(d.label);
         auto &b0a = *b0as.getLocal();
         auto &b1a = *b1as.getLocal();
         auto &b2a = *b2as.getLocal();
@@ -624,8 +731,8 @@ int main(int argc, char** argv) {
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Recieve from GPU failed.");
         data_movement_timer.stop();
       } else if (task_type == 4) {
-        auto i = std::get<2>(d);
-        auto j = std::get<3>(d);
+        auto i = std::get<1>(d.label);
+        auto j = std::get<2>(d.label);
         auto b0 = *b0s.getLocal();
         auto b1 = *b1s.getLocal();
         //auto handle = *handles.getLocal();
@@ -646,29 +753,35 @@ int main(int argc, char** argv) {
         stat = cublasGetMatrix(block_size, block_size, sizeof(double), b1, block_size, spd + i * block_size + j * block_size * dim_size, dim_size);
         if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Recieve from GPU failed. (19)");
         data_movement_timer.stop();
-      } else if (task_type != 0) {
-        // Task type 0 signals to jump ahead to generation.
-        // Otherwise, something has gone terribly wrong.
+      } else if (task_type == 0) {
+        generate_tasks_lazy(nblocks, min_queue_size, max_queue_size, g, label_map, map_lock, ctx, graph_size, resume_generation_condition, condition_lock);
+      } else {
         GALOIS_DIE("Unrecognized task type.");
       }
 
       updating_tasks_timer.start();
       for (auto e : g.edges(n, galois::MethodFlag::UNPROTECTED)) {
         auto dst = g.getEdgeDst(e);
-        if (0 == --std::get<0>(g.getData(dst, galois::MethodFlag::UNPROTECTED))) {
+        if (0 == --g.getData(dst, galois::MethodFlag::UNPROTECTED).waiting_on) {
           ctx.push(dst);
         }
       }
 
       // Now remove this node entirely.
-      g.removeNode(n);
-      std::unique_lock graph_lock_handle{graph_lock};
-      // Lock covers the map from labels to nodes too, so remove it after qcquiring the lock.
-      label_map.erase(data_to_label(d));
-      generator.expand_new_tasks(min_queue_size, max_queue_size, ctx, std::move(graph_lock_handle));
+      {
+        std::unique_lock<std::mutex> graph_lock_handle{map_lock};
+        g.removeNode(n);
+        // Lock covers the map from labels to nodes too, so remove it after qcquiring the lock.
+        label_map.erase(d.label);
+        //generator.expand_new_tasks(min_queue_size, max_queue_size, ctx, std::move(graph_lock_handle));
+      }
+      if ((graph_size--) == min_queue_size) {
+        resume_generation_condition.notify_one();
+      }
       updating_tasks_timer.stop();
     },
-    galois::loopname("cholesky_tasks"), galois::wl<PSChunk>()
+    galois::loopname("cholesky_tasks"), galois::wl<PSChunk>(),
+    galois::no_conflicts()
   );
 
   {
