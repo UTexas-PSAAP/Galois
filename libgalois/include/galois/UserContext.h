@@ -128,6 +128,15 @@ public:
     this->push(std::forward<Args>(args)...);
   }
 
+  //! Release the buffered work immediately instead of
+  //! waiting for the current operator to complete.
+  template <typename... Args>
+  void send_work() {
+    if (fastPushBack && pushBuffer.size()) {
+      fastPushBack(pushBuffer);
+    }
+  }
+
   //! Force the abort of this iteration
   void abort() { galois::runtime::signalConflict(); }
 
