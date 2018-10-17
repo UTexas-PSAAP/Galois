@@ -665,7 +665,7 @@ int main(int argc, char** argv) {
         computation_calls_timer.stop();
         data_movement_timer.start();
         stat = sa::cublas::GetMatrix(b0a, spd_bk(j, j, sa::slice(), sa::slice()));
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("recieve failed.");
+        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("receive failed.");
         data_movement_timer.stop();
       } else if (task_type == 2) {
         auto j = std::get<2>(d.label);
@@ -682,7 +682,7 @@ int main(int argc, char** argv) {
         auto stat2 = cusolverDnDpotrf(cusolver_handle, CUBLAS_FILL_MODE_LOWER, block_size, b0, block_size, lwork, lwork_size, *dev_infos.getLocal());
         if (stat2 != CUSOLVER_STATUS_SUCCESS) GALOIS_DIE("Cholesky block solve failed. (6)");
         auto stat3 = cudaMemcpy(&info, *dev_infos.getLocal(), sizeof(int), cudaMemcpyDeviceToHost);
-        if (stat3 != cudaSuccess) GALOIS_DIE("Recieve status after Cholesky on block failed. (7)");
+        if (stat3 != cudaSuccess) GALOIS_DIE("Receive status after Cholesky on block failed. (7)");
         if (info != 0) {
           std::cout << info << std::endl;
           std::stringstream ss;
@@ -699,7 +699,7 @@ int main(int argc, char** argv) {
         computation_calls_timer.stop();
         data_movement_timer.start();
         stat = cublasGetMatrix(block_size, block_size, sizeof(double), b0, block_size, spd + j * block_size + j * block_size * dim_size, dim_size);
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Recieve from GPU failed. (10)");
+        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Receive from GPU failed. (10)");
         data_movement_timer.stop();
       } else if (task_type == 3) {
         auto i = std::get<0>(d.label);
@@ -728,7 +728,7 @@ int main(int argc, char** argv) {
         computation_calls_timer.stop();
         data_movement_timer.start();
         stat = sa::cublas::GetMatrix(b0a, spd_bk(i,j,sa::slice(),sa::slice()));
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Recieve from GPU failed.");
+        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Receive from GPU failed.");
         data_movement_timer.stop();
       } else if (task_type == 4) {
         auto i = std::get<1>(d.label);
@@ -751,7 +751,7 @@ int main(int argc, char** argv) {
         computation_calls_timer.stop();
         data_movement_timer.start();
         stat = cublasGetMatrix(block_size, block_size, sizeof(double), b1, block_size, spd + i * block_size + j * block_size * dim_size, dim_size);
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Recieve from GPU failed. (19)");
+        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Receive from GPU failed. (19)");
         data_movement_timer.stop();
       } else if (task_type == 0) {
         generate_tasks_lazy(nblocks, min_queue_size, max_queue_size, g, label_map, map_lock, ctx, graph_size, resume_generation_condition, condition_lock);
@@ -808,7 +808,7 @@ int main(int argc, char** argv) {
     stat3 = cusolverDnDpotrf(*cusolver_handles.getLocal(), CUBLAS_FILL_MODE_LOWER, dim_size, dev_spd2, dim_size, work, work_size, *dev_infos.getLocal());
     if (stat3 != CUSOLVER_STATUS_SUCCESS) GALOIS_DIE("Cholesky block solve failed.");
     stat = cudaMemcpy(&info, *dev_infos.getLocal(), sizeof(int), cudaMemcpyDeviceToHost);
-    if (stat != cudaSuccess) GALOIS_DIE("Recieve status after Cholesky on block failed. (7)");
+    if (stat != cudaSuccess) GALOIS_DIE("Receive status after Cholesky on block failed. (7)");
     if (info != 0) {
       std::cout << info << std::endl;
       std::stringstream ss;
@@ -824,7 +824,7 @@ int main(int argc, char** argv) {
     cudaDeviceSynchronize();
     cusolver_dpotrf_timer.stop();
     stat2 = cublasGetMatrix(dim_size, dim_size, sizeof(double), dev_spd2, dim_size, spd2, dim_size);
-    if (stat2 != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Recieve failed.");
+    if (stat2 != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Receive failed.");
     cusolver_dpotrf_with_movement.stop();
   }
   
