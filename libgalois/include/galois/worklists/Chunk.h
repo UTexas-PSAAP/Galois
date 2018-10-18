@@ -20,6 +20,8 @@
 #ifndef GALOIS_WORKLIST_CHUNK_H
 #define GALOIS_WORKLIST_CHUNK_H
 
+#include <iostream>
+
 #include "galois/FixedSizeRing.h"
 #include "galois/substrate/PaddedLock.h"
 #include "galois/runtime/Mem.h"

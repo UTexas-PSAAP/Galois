@@ -75,16 +75,19 @@ std::string task_to_str(task_data &t) {
   std::stringstream ss;
   int type = std::get<3>(t.label);
   ss << "T" << type << "(";
-  if (type == 1 || type == 4) {
-    ss << std::get<1>(t.label) << ", " << std::get<2>(t.label) << ")";
+  if (type == 0) {
+    ss << "0";
+  } else if (type == 1 || type == 4) {
+    ss << std::get<1>(t.label) << ", " << std::get<2>(t.label);
   } else if (type == 2) {
-    ss << std::get<2>(t.label) << ")";
+    ss << std::get<2>(t.label);
   } else if (type == 3) {
-    ss << std::get<0>(t.label) << ", " << std::get<1>(t.label) << ", " << std::get<2>(t.label) << ")";
+    ss << std::get<0>(t.label) << ", " << std::get<1>(t.label) << ", " << std::get<2>(t.label);
   } else {
     // Invalid task type
     assert(false);
   }
+  ss << ")";
   return ss.str();
 }
 
@@ -195,7 +198,7 @@ void generate_tasks_lazy(int nblocks, std::size_t min_size, std::size_t max_size
       if (label_map.count(dep)) {
         g.addEdge(label_map[task_label(i0, i1, i2, tp)], n);
       } else {
-        if ((g.getData(n).waiting_on--) == 0) {
+        if (!(--g.getData(n).waiting_on)) {
           ctx.push(n);
         }
       }
@@ -522,7 +525,10 @@ void print_mat(double *m, std::size_t rows, std::size_t cols, std::ptrdiff_t row
   std::cout << std::endl;
 }
 
-using PSChunk = galois::worklists::PerSocketChunkFIFO<16>;
+using PSChunk = galois::worklists::PerSocketChunkFIFO<1>;
+using PTChunk = galois::worklists::PerThreadChunkFIFO<1>;
+auto indexer = [](const GNode &) {return int(0);};
+using OBIM = galois::worklists::OrderedByIntegerMetric<decltype(indexer), PSChunk>;
 
 int main(int argc, char** argv) {
   galois::SharedMemSys G;
@@ -548,7 +554,7 @@ int main(int argc, char** argv) {
   // Don't include the "generate tasks" node in this count.
   std::atomic<std::size_t> graph_size = 0;
   LMap label_map;
-  // Coarse-grained lock to limit access to the label map.
+  // Coarse-grained lock to limit access to the label map and graph.
   std::mutex map_lock;
   std::condition_variable resume_generation_condition;
   std::mutex condition_lock;
@@ -760,23 +766,21 @@ int main(int argc, char** argv) {
       }
 
       updating_tasks_timer.start();
-      for (auto e : g.edges(n, galois::MethodFlag::UNPROTECTED)) {
-        auto dst = g.getEdgeDst(e);
-        if (0 == --g.getData(dst, galois::MethodFlag::UNPROTECTED).waiting_on) {
-          ctx.push(dst);
-        }
-      }
-
-      // Now remove this node entirely.
       {
-        std::unique_lock<std::mutex> graph_lock_handle{map_lock};
+        std::lock_guard<std::mutex> lock{map_lock};
+        for (auto e : g.edges(n, galois::MethodFlag::UNPROTECTED)) {
+          auto dst = g.getEdgeDst(e);
+          if (!(--g.getData(dst, galois::MethodFlag::UNPROTECTED).waiting_on)) {
+            ctx.push(dst);
+          }
+        }
+        // Now remove this node entirely.
         g.removeNode(n);
-        // Lock covers the map from labels to nodes too, so remove it after qcquiring the lock.
         label_map.erase(d.label);
-        //generator.expand_new_tasks(min_queue_size, max_queue_size, ctx, std::move(graph_lock_handle));
-      }
-      if ((graph_size--) == min_queue_size) {
-        resume_generation_condition.notify_one();
+      
+        if ((graph_size--) == min_queue_size) {
+          resume_generation_condition.notify_one();
+        }
       }
       updating_tasks_timer.stop();
     },

@@ -286,6 +286,7 @@ protected:
   void fastPushBack(typename UserContextAccess<value_type>::PushBufferTy& x) {
     wl.push(x.begin(), x.end());
     x.clear();
+    wl.flush();
   }
 
   bool checkEmpty(WorkListTy&, ThreadLocalData&, ...) { return true; }
