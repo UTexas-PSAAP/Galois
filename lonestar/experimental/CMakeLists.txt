@@ -1,4 +1,5 @@
 add_subdirectory(barneshut)
+add_subdirectory(barneshut_task)
 #add_subdirectory(bc-inner)
 add_subdirectory(betweennesscentrality)
 add_subdirectory(bfs)
