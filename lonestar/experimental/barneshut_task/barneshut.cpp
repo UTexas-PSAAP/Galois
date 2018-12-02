@@ -12,6 +12,8 @@
 #include <cuda_runtime.h>
 #include <cusolverDn.h>
 
+#include <boost/coroutine2/coroutine.hpp>
+
 #include "galois/Galois.h"
 #include "galois/gstl.h"
 #include "galois/Timer.h"
@@ -26,6 +28,8 @@
 #include "strided_array.hpp"
 #include "cuda_unique.hpp"
 #include "cublas_wrappers.hpp"
+
+#define GRAVITATIONAL_CONSTANT 6.6740831E-11
 
 static const char* name = "Task Based Cholesky Factorization";
 static const char* desc = "";
@@ -63,9 +67,12 @@ struct tree_node_data {
 };
 
 enum task_type {
+  generate_all,
   recurse_summary,
   compute_summary,
-  compute_forces
+  signal_summaries_completed,
+  compute_near_forces,
+  compute_far_forces
 };
 
 struct task_label {
@@ -87,6 +94,8 @@ struct task_graph {
   task_graph_base g;
   label_map_t label_map;
   // This lock manages creation and deletion of tasks in the graph and in the label map.
+  // One of it's primary purposes is to guarantee that updates that need to happen in both
+  // places appear as atomic to the observer.
   std::mutex lock;
   std::condition_variable condition;
 
@@ -104,13 +113,16 @@ struct task_graph {
     condition.wait(lk, [&](){return g.size() < size;});
   }
 
-  void register_task(auto &ctx, task_label label, std::size_t num_deps, task_label* dependencies) {
-    std::unique_lock<std::mutex> lk{lock};
-    auto n = g.createNode(num_deps, label);
+  // Helper function. DOESN'T LOCK.
+  // Create a new node with the given dependencies,
+  // pushing it as ready if it's ready,
+  // though not flushing the worklist.
+  task_graph_node new_task_node_from_label(auto &ctx, task_label label, std::size_t num_deps, task_label *dependencies, std::size_t prealloc_size = 0) {
+    auto n = g.createNode(std::max(prealloc_size, num_deps), label);
     g.addNode(n);
     label_map[label] = n;
     for (std::size_t i = 0; i < num_deps; i++) {
-      auto dep = dependencies[i];
+      auto &dep = dependencies[i];
       if (label_map.count(dep)) {
         g.addEdge(label_map[dep], n);
       } else {
@@ -119,10 +131,52 @@ struct task_graph {
         }
       }
     }
-    if (g.size() < max_task_num) {
-      return;
-    }
+    return n;
+  }
+
+  // User-facing task registration interface.
+  // Create a task that depends on the given things.
+  void register_task(auto &ctx, task_label label, std::size_t num_deps, task_label* dependencies) {
+    std::unique_lock<std::mutex> lk{lock};
+    new_task_node_from_label(ctx, label, num_deps, dependencies);
+    ctx.send_work();
     condition.wait(lk, [&](){return g.size() < min_task_num;});
+  }
+
+  // Hard to describe. This one needs some more thought/description.
+  // It implements recursion by allowing a task to perform a "blocking call"
+  // to a series of other ready tasks. It changes its own label to the given
+  // new label, and adds the created tasks as things it depends on.
+  // The things that depend on it remain the same.
+  // Conceptually, the new label is the label for the new task
+  // representing the work that happens after the "blocking calls" finish.
+  // Note that this does not actually block the current execution thread.
+  void blocking_calls(auto &ctx, task_graph_node node, task_label new_label, std::size_t num_called, task_label *called) {
+    std::unique_lock<std::mutex> lk{lock};
+    // Switch the label on the node from the current (now completed) task
+    // instead of creating a new node and then forwarding its dependencies.
+    // Conceptually that's what this does though.
+    auto &data = g.getData(node, galois::MethodFlag::UNPROTECTED);
+    auto &label = data.label;
+    label_map.erase(old_label);
+    label = new_label;
+    label_map[label] = node;
+    data.remaining_dependencies = num_called;
+    // Create the requested new tasks and make the newly labeled task depend on them.
+    for (std::size_t i = 0; i < num_called; i++) {
+      // Make the new replacement for this node depend on the created tasks.
+      auto called_node = new_task_node_from_label(ctx, called[i], 0, nullptr, 1);
+      g.addEdge(called_node, node);
+    }
+    // If nothing was actually called, the newly created task is ready
+    // and must be marked as such since no other task will mark it ready later.
+    if (num_called == 0) {
+      ctx.push(node);
+    }
+    // Now that all that is done, flush the work list.
+    // TODO: Confirm that this can be done at a finer granularity
+    // and move it in to the new task node creation routine.
+    ctx.send_work();
   }
 
   void remove_task_node(auto &ctx, std::unique_lock<std::mutex> &&lk, task_graph_node node) {
@@ -153,59 +207,16 @@ struct task_graph {
     remove_task_node(ctx, std::move(lk), node);
   }
 
+  // Remove a task, forwarding the things that depend on it to a
+  // different task instead of marking them as ready.
+  void remove_and_forward(task_graph_node node, task_label new_label) {
+    std::unique_lock<std::mutex> lk{lock};
+    auto &node_data = g.getData(node, galois::MethodFlag::UNPROTECTED);
+    label_map.erase(node_data.label);
+    label_map[new_label] = node;
+    node_data.label = new_label;
+  }
 };
-
-void generate_tasks_lazy(task_graph &tsk, auto &ctx) {
-  ;
-}
-
-void print_cublas_status(cublasStatus_t stat) {
-  if (stat == CUBLAS_STATUS_SUCCESS) {
-    std::cout << "CUBLAS_STATUS_SUCCESS" << std::endl;
-  } else if (stat == CUBLAS_STATUS_NOT_INITIALIZED) {
-    std::cout << "CUBLAS_STATUS_NOT_INITIALIZED" << std::endl;
-  } else if (stat == CUBLAS_STATUS_ALLOC_FAILED) {
-    std::cout << "CUBLAS_STATUS_ALLOC_FAILED" << std::endl;
-  } else if (stat == CUBLAS_STATUS_INVALID_VALUE) {
-    std::cout << "CUBLAS_STATUS_INVALID_VALUE" << std::endl;
-  } else if (stat == CUBLAS_STATUS_ARCH_MISMATCH) {
-    std::cout << "CUBLAS_STATUS_ARCH_MISMATCH" << std::endl;
-  } else if (stat == CUBLAS_STATUS_MAPPING_ERROR) {
-    std::cout << "CUBLAS_STATUS_MAPPING_ERROR" << std::endl;
-  } else if (stat == CUBLAS_STATUS_EXECUTION_FAILED) {
-    std::cout << "CUBLAS_STATUS_EXECUTION_FAILED" << std::endl;
-  } else if (stat == CUBLAS_STATUS_INTERNAL_ERROR) {
-    std::cout << "CUBLAS_STATUS_INTERNAL_ERROR" << std::endl;
-  } else if (stat == CUBLAS_STATUS_NOT_SUPPORTED) {
-    std::cout << "CUBLAS_STATUS_NOT_SUPPORTED" << std::endl;
-  } else if (stat == CUBLAS_STATUS_LICENSE_ERROR) {
-    std::cout << "CUBLAS_STATUS_LICENSE_ERROR" << std::endl;
-  } else {
-    std::cout << "Unknown cublas status." << std::endl;
-  }
-}
-
-void print_cusolver_status(cusolverStatus_t stat) {
-  if (stat == CUSOLVER_STATUS_SUCCESS) {
-    std::cout << "CUSOLVER_STATUS_SUCCESS" << std::endl;
-  } else if (stat == CUSOLVER_STATUS_NOT_INITIALIZED) {
-    std::cout << "CUSOLVER_STATUS_NOT_INITIALIZED" << std::endl;
-  } else if (stat == CUSOLVER_STATUS_ALLOC_FAILED) {
-    std::cout << "CUSOLVER_STATUS_ALLOC_FAILED" << std::endl;
-  } else if (stat == CUSOLVER_STATUS_INVALID_VALUE) {
-    std::cout << "CUSOLVER_STATUS_INVALID_VALUE" << std::endl;
-  } else if (stat == CUSOLVER_STATUS_ARCH_MISMATCH) {
-    std::cout << "CUSOLVER_STATUS_ARCH_MISMATCH" << std::endl;
-  } else if (stat == CUSOLVER_STATUS_EXECUTION_FAILED) {
-    std::cout << "CUSOLVER_STATUS_EXECUTION_FAILED" << std::endl;
-  } else if (stat == CUSOLVER_STATUS_INTERNAL_ERROR) {
-    std::cout << "CUSOLVER_STATUS_INTERNAL_ERROR" << std::endl;
-  } else if (stat == CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED) {
-    std::cout << "CUSOLVER_STATUS_MATRIX_TYPE_NOT_SUPPORTED" << std::endl;
-  } else {
-    std::cout << "Unknown cusolver status." << std::endl;
-  }
-}
 
 void print_2d_array(double *m, std::size_t rows, std::size_t cols, std::ptrdiff_t row_stride) {
   for (std::size_t i = 0; i < rows; i++) {
@@ -346,6 +357,232 @@ void print_tree_ptrs(auto &tree, auto node, std::size_t prefix = 0) {
   }
 }
 
+// TODO: This should be a bit more tolerant to floating point rounding errors.
+bool separated_from(tree_t &tree, tree_node_t source, tree_node_t other) {
+  double *bounds = tree.getData(source, galois::MethodFlag::UNPROTECTED).bounds;
+  double *other_bounds = tree.getData(other, galois::MethodFlag::UNPROTECTED).bounds;
+  for (std::size_t i = 0; i < dims; i++) {
+    double mn = 2 * bounds[2 * i] - bounds[2 * i + 1];
+    double mx = 2 * bounds[2 * i + 1] - bounds[2 * i];
+    double omn = other_bounds[2 * i];
+    double omx = other_bounds[2 * i + 1];
+    if (!((mn < omn && omn < mx) || (mn < omx && omx < mx))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool is_final(tree_t &tree, tree_node_t node) {
+  return (tree.getData(node, galois::MethodFlag::UNPROTECTED).num_pts <= max_group_size);
+}
+
+template <typename T>
+void apply_to_neighbors_impl(tree_t &tree, tree_node_t source, tree_node_t other, const T &operation) {
+  if (is_final(tree, other) || separated_from(tree, source, other)) {
+    operation(tree, other);
+  } else {
+    for (auto edge : tree.edges(other, galois::MethodFlag::UNPROTECTED)) {
+      auto child = tree.getEdgeDst(edge);
+      apply_to_neighbors_impl(tree, source, child, operation);
+    }
+  }
+}
+
+template <typename T>
+void apply_to_neighbors(tree_t &tree, tree_node_t source, const T &operation) {
+  auto current = source;
+  auto current_data = &tree.getData(current, galois::MethodFlag::UNPROTECTED);
+  while (current_data->parent != nullptr) {
+    for (auto edge : tree.edges(current_data->parent, galois::MethodFlag::UNPROTECTED)) {
+      auto sibling = tree.getEdgeDst(edge);
+      if (sibling == current) continue;
+      apply_to_neighbors_impl(tree, source, sibling, operation);
+    }
+    current = current_data->parent;
+    current_data = &tree.getData(current, galois::MethodFlag::UNPROTECTED);
+  }
+}
+
+template <typename T>
+void apply_to_leaves(tree_t &tree, tree_node_t source, const T &operation) {
+  if (is_final(tree, source)) {
+    operation(tree, source);
+  } else {
+    for (auto edge : tree.edges(source, galois::MethodFlag::UNPROTECTED)) {
+      auto child = tree.getEdgeDst(edge);
+      apply_to_leaves(tree, child, operation);
+    }
+  }
+}
+
+void print_node(tree_t &tree, tree_node_t leaf) {
+  auto &data = tree.getData(leaf, galois::MethodFlag::UNPROTECTED);
+  double *bounds = data.bounds;
+  for (std::size_t i = 0; i < dims; i++) {
+    std::cout << "(" << bounds[2 * i] << ", " << bounds[2 * i + 1] << ")";
+  }
+  std::cout << std::endl;
+}
+
+void print_leaves(tree_t &tree, tree_node_t root_node) {
+  apply_to_leaves(tree, root_node, print_node);
+  std::cout << std::endl;
+}
+
+tree_node_t first_leaf(tree_t &tree, tree_node_t node) {
+  while(!is_final(tree, node)) {
+    auto &data = tree.getData(node, galois::MethodFlag::UNPROTECTED);
+    node = tree.getEdgeDst(*tree.edges(node, galois::MethodFlag::UNPROTECTED).begin());
+  }
+  return node;
+}
+
+void print_neighbors(tree_t &tree, tree_node_t node) {
+  apply_to_neighbors(tree, node, print_node);
+  std::cout << std::endl;
+}
+
+void print_neighbors_all(tree_t &tree, tree_node_t root) {
+  apply_to_leaves(tree, root, print_neighbors);
+}
+
+void generate_tasks_lazy(task_graph &tsk, tree_t &tree, tree_node_t root, auto &ctx) {
+  task_label root_recursion{recurse_summary, root};
+  tsk.register_task(ctx, root_recursion, 0, nullptr);
+  task_label signal_recursion_complete{signal_summaries_completed, root};
+  tsk.register_task(ctx, signal_recursion_complete, 1, &root_recursion);
+  // TODO: After switching so execution waits only on ready tasks, just generate these tasks in a single pass
+  // on the leaf nodes. It'll deadlock if that's done before the switch in waiting semantics.
+  apply_to_leaves(tree, root, [&](auto &tree, auto leaf) {
+    tsk.register_task(ctx, task_label(compute_near_forces, leaf), 0, nullptr);
+  });
+  apply_to_leaves(tree, root, [&](auto &tree, auto leaf) {
+    tsk.register_task(ctx, task_label(compute_far_forces, leaf), 1, &signal_recursion_complete);
+  });
+}
+
+template <typename T, typename S, std::size_t dims>
+void set_array(sa::strided_array<T, dims> a, S value) {
+  static_assert(dims <= 2, "TODO: generalize array setting routine to work in higher dimensional arrays. Note: this is best done via an indexing refactor...");
+  for (std::size_t i = 0; i < a.axes[0].shape; i++) {
+    if constexpr (dims == 1) {
+      a(i) = value;
+    } else {
+      set_array(a(i, sa::slice()), value);
+    }
+  }
+}
+
+double set_differences_and_coef(sa::strided_array<double, 1> p1, sa::strided_array<double, 1> p2, sa::strided_array<double, 1> tmp) {
+  assert(p1.axes[0].shape > 0);
+  assert(p1.axes[0].shape == p2.axes[0].shape);
+  double dist2 = 0;
+  for (std::size_t j = 0; j < p1.axes[0].shape; j++) {
+    temp(i,j) = p1(j) - p2(j);
+    dist2 += temp(i,j) * temp(i,j);
+  }
+  return GRAVITATIONAL_CONSTANT / (dist2 * std::sqrt(dist2));
+}
+
+enum force_add_mode {bidirectional, unidirectional};
+
+template <force_add_mode mode>
+struct force_between_impl {
+  // This is an attempt to avoid repeating code between the unidirectional and bidirectional case.
+  // This would be nicer with non-scoped constexpr-if, but whatever.
+  if constexpr (mode == bidirectional) {
+    static void points(sa::strided_array<double, 1> p1, sa::strided_array<double, 1> p2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 1> f1, sa::strided_array<double, 1> f2) {
+      auto coef = set_differences_and_distance2(p1, p2, tmp);
+      for (std::size_t j = 0; j < p1.axes[0].shape; j++) {
+        auto force_in_direction = temp(j) * coef;
+        f1(j) -= force_in_direction;
+        f2(j) += force_in_direction;
+      }
+    }
+  } else {
+    static_assert(mode == unidirectional);
+    static void points(sa::strided_array<double, 1> p1, sa::strided_array<double, 1> p2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 1> f2) {
+      auto coef = set_differences_and_distance(p1, p2, tmp);
+      for (std::size_t j = 0; j < p1.axes[0].shape; j++) {
+        auto force_in_direction = temp(j) * coef;
+        f2(j) += force_in_direction;
+      }
+    }
+  }
+
+  if constexpr (mode == bidirectional) {
+    static void point_and_cloud(sa::strided_array<double, 1> p1, sa::strided_array<double, 2> ps2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 1> f1, sa::strided_array<double, 2> fs2) {
+      for (std::size_t i = 0; i < p2.axes[0]; i++) {
+        points(p1, ps2(i), tmp, f1, fs2(i));
+      }
+    }
+  } else {
+    static_assert(mode == unidirectional);
+    static void point_and_cloud(sa::strided_array<double, 1> p1, sa::strided_array<double 2> ps2, sa::strided_array<double 1> tmp, sa::strided_array<double, 2> fs2) {
+      for (std::size_t i = 0; i < p2.axes[0]; i++) {
+        points(p1, ps2(i), tmp, fs2(i));
+      }
+    }
+  }
+
+  if constexpr (mode == bidirectional) {
+    static void clouds(sa::strided_array<double, 2> ps1, sa::strided_array<double, 2> ps2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 2> fs1, sa::strided_array<double, 2> fs2) {
+      for (std::size_t i = 0; i < p1.axes[0].shape; i++) {
+        point_and_cloud(ps1(i), ps2, tmp, fs1(i), fs2);
+      }
+    }
+  } else {
+    static_assert(mode == unidirectional);
+    static void clouds(sa::strided_array<double, 2> ps1, sa::strided_array<double, 2> ps2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 2> fs2) {
+      for (std::size_t i = 0; i < p1.axes[0].shape; i++) {
+        points(ps1(i), ps2, tmp, fs2);
+      }
+    }
+  }
+
+  if constexpr (mode == bidirectional) {
+    template <std::size_t d1, std::size_t d2>
+    static void force_between(sa::strided_array<double, d1> p1, sa::strided_array<double, d2> p2, sa::strided_array<double, 1> tmp, sa::strided_array<double, d1> f1, sa::strided_array<double, d2> f2) {
+      static_assert(d1 <= d2, "Force of cloud on point not implemented.");
+      if constexpr (d1 == 1 && d2 == 1) {
+        points(p1, p2, tmp, f1, f2);
+      } else if (d1 == 1 && d2 == 2) {
+        point_and_cloud(p1, p2, tmp, f1, f2);
+      } else if (d1 == 2 && d2 == 2) {
+        clouds(p1, p2, tmp, f1, f2);
+      } else {
+        static_assert(false, "Unexpected dimensions of input arrays.");
+      }
+    }
+  } else {
+    static_assert(mode == unidirectional)
+    static void force_between(sa::strided_array<double, d1> p1, sa::strided_array<double, d2> p2, sa::strided_array<double, 1> tmp, sa::strided_array<double, d2> f2) {
+      static_assert(d1 <= d2, "Force of cloud on point not implemented.");
+      if constexpr (d1 == 1 && d2 == 1) {
+        points(p1, p2, tmp, f2);
+      } else if (d1 == 1 && d2 == 2) {
+        point_and_cloud(p1, p2, tmp, f2);
+      } else if (d1 == 2 && d2 == 2) {
+        clouds(p1, p2, tmp, f2);
+      } else {
+        static_assert(false, "Unexpected dimensions of input arrays.");
+      }
+    }
+  }
+};
+
+template <force_add_mode mode, std::size_t d1, std::size_t d2>
+using force_between = force_between_impl<mode>::template force_between<d1, d2>;
+
+void intra_cloud_force(sa::strided_array<double, 2> cloud, sa::strided_array<double, 1> temp, sa::strided_array<double, 2> forces) {
+  assert(cloud.axes[0].shape == forces.axes[0].shape);
+  assert(forces.axes[0].shape > 0);
+  for (std::size_t i = 1; i < cloud.axes[0].shape; i++) {
+    force_between<bidirectional>(cloud(i, sa::slice()), cloud(sa::slice(i), sa::slice()), temp, forces(i, sa::slice()), forces(sa::slice(i), sa::slice));
+  }
+}
+
 int main(int argc, char** argv) {
   galois::SharedMemSys G;
   LonestarStart(argc, argv, name, desc, url);
@@ -429,6 +666,7 @@ int main(int argc, char** argv) {
   //print_2d_array(points);
 
   //print_tree(tree, root_node);
+  //std::cout << std::endl;
   //print_tree_ptrs(tree, root_node);
 
   if (verify) {
@@ -463,236 +701,83 @@ int main(int argc, char** argv) {
     }
   }
 
-  
+  //print_leaves(tree, root_node);
+  //print_neighbors(tree, first_leaf(tree, root_node));
+  //print_neighbors_all(tree, root_node);
 
-  /*;;;;
+  // Insert the generation task manually.
+  // TODO: There should be some sort of machinery in the main task graph that hides this.
+  auto generation_task = tasks.g.createNode(0, task_label(root_node, generate_all));
+  tasks.g.addNode(init_node);
 
-  auto spd_manager = generate_symmetric_positive_definite(dim_size, seed);
-  auto spd = spd_manager.get();
-  sa::strided_array<double, 2> spd_ar{spd, sa::array_axes<2>({{{dim_size, sizeof(double)}, {dim_size, dim_size * sizeof(double)}}})};
-  auto spd_bk = spd_ar.block((int)block_size, (int)block_size);
-  //std::cout.precision(19);
-  //std::cout << "generated input:" << std::endl;
-  //print_mat(spd, dim_size, dim_size, dim_size);
-
-  //galois::StatTimer construction_timer{"Task graph construction"};
-
-  //construction_timer.start();
-  Graph g;
-  // Use an atomic to track (approximately) the graph size separately.
-  // Don't include the "generate tasks" node in this count.
-  std::atomic<std::size_t> graph_size = 0;
-  LMap label_map;
-  // Coarse-grained lock to limit access to the label map and graph.
-  std::mutex map_lock;
-  std::condition_variable resume_generation_condition;
-  std::mutex condition_lock;
-  //auto generator = task_generator(g, label_map, nblocks);
-  // Use an all zeros node to denote the "start generating" task.
-  auto init_node = g.createNode(0, task_label(0, 0, 0, 0));
-  g.addNode(init_node);
-  //generate_tasks(nblocks, g, label_map);
-  //construction_timer.stop();
-  //print_deps(g);
-  if (dependence_outfile != "") {
-    // Use the non-lazy generation code to write the dependency
-    // information to the desired file.
-    Graph g2;
-    LMap label_map_2;
-    generate_tasks(nblocks, g2, label_map_2);
-    write_dependences(g, dependence_outfile);
-  }
-
-  // Timers to measure the portion of time spent on different portions of the given operator.
-  galois::PerThreadTimer<true> updating_tasks_timer{"cholesky_tasks", "task updates"};
-  galois::PerThreadTimer<true> computation_calls_timer{"cholesky_tasks", "computation calls"};
-  galois::PerThreadTimer<true> data_movement_timer{"cholesky_tasks", "data movement"};
-  galois::StatTimer verification_timer{"Verification of Cholesky decomposition."};
-
-  // Now set up the needed resources for each thread.
-  galois::substrate::PerThreadStorage<sa::cublas::context> cublas_contexts(nullptr);
-  galois::substrate::PerThreadStorage<cusolverDnHandle_t> cusolver_handles(nullptr);
-  galois::substrate::PerThreadStorage<int> lwork_sizes;
-  sa::array_axes<2> block_axes{{{{block_size, sizeof(double)}, {block_size, block_size * sizeof(double)}}}};
-  galois::substrate::PerThreadStorage<double*> b0s;
-  galois::substrate::PerThreadStorage<sa::strided_array<double, 2>> b0as{nullptr, block_axes};
-  galois::substrate::PerThreadStorage<double*> b1s;
-  galois::substrate::PerThreadStorage<sa::strided_array<double, 2>> b1as{nullptr, block_axes};
-  galois::substrate::PerThreadStorage<double*> b2s;
-  galois::substrate::PerThreadStorage<sa::strided_array<double, 2>> b2as{nullptr, block_axes};
-  galois::substrate::PerThreadStorage<double*> lworks;
-  galois::substrate::PerThreadStorage<int*> dev_infos;
+  // Set up temporary buffers used by the threads.
+  galois::substrate::PerThreadStorage<std::unique_ptr<double>> temp_buffers{};
+  sa::array_axes<1> tmp_axes{{{{std::size_t(dims), sizeof(double)}}}};
+  galois::substrate::PerThreadStorage<sa::strided_array<double, 1>> temps{nullptr, tmp_axes};
   galois::on_each([&](unsigned int tid, unsigned int nthreads) {
-    int devices = 0;
-    auto stat3 = cudaGetDeviceCount(&devices);
-    if (devices < nthreads) {
-      GALOIS_DIE("The number of threads desired is greater than the number of cuda devices available.");
-    }
-    stat3 = cudaSetDevice(tid);
-    if (stat3 != cudaSuccess) {
-      GALOIS_DIE("Failed to allocate one device per thread.");
-    }
-    auto stat = cublasCreate(&(cublas_contexts.getLocal()->handle));
-    if (stat != CUBLAS_STATUS_SUCCESS) {
-      GALOIS_DIE("Failed to initialize cublas.");
-    }
-    auto stat2 = cusolverDnCreate(cusolver_handles.getLocal());
-    if (stat2 != CUSOLVER_STATUS_SUCCESS) {
-      GALOIS_DIE("Failed to initialize cusolver.");
-    }
-    stat2 = cusolverDnDpotrf_bufferSize(*cusolver_handles.getLocal(), CUBLAS_FILL_MODE_LOWER, block_size, *b0s.getLocal(), block_size, lwork_sizes.getLocal());
-    if (stat2 != cudaSuccess) {
-      GALOIS_DIE("Failed to determine lwork size for cusolver dpotrf.");
-    }
-    stat3 = cudaMalloc(lworks.getLocal(), static_cast<std::size_t>(((*lwork_sizes.getLocal()) * sizeof(double))));
-    if (stat3 != cudaSuccess) {
-      GALOIS_DIE("Failed to allocate GPU workspace for per-block Cholesky factorization.");
-    }
-    stat3 = cudaMalloc(dev_infos.getLocal(), sizeof(int));
-    if (stat3 != cudaSuccess) {
-      GALOIS_DIE("Failed to allocate GPU int for Cholesky call status.");
-    }
-    stat3 = cudaMalloc(b0s.getLocal(), static_cast<std::size_t>(block_size * block_size * sizeof(double)));
-    if (stat3 != cudaSuccess) {
-      GALOIS_DIE("Failed to allocate GPU buffers for blocked operations.");
-    }
-    b0as.getLocal()->data = *b0s.getLocal();
-    stat3 = cudaMalloc(b1s.getLocal(), static_cast<std::size_t>(block_size * block_size * sizeof(double)));
-    if (stat3 != cudaSuccess) {
-      GALOIS_DIE("Failed to allocate GPU buffers for blocked operations.");
-    }
-    b1as.getLocal()->data = *b1s.getLocal();
-    stat3 = cudaMalloc(b2s.getLocal(), static_cast<std::size_t>(block_size * block_size * sizeof(double)));
-    if (stat3 != cudaSuccess) {
-      GALOIS_DIE("Failed to allocate GPU buffers for blocked operations.");
-    }
-    b2as.getLocal()->data = *b2s.getLocal();
+    *temp_buffers.getLocal() = std::make_unique<double*>(dims);
+    temps.getLocal()->data = (*temp_buffers.getLocal()).get();
   });
 
-  std::atomic<int> counter{0};
-
-  // Now execute the tasks.
   galois::for_each(
-    galois::iterate({init_node}),
-    [&](GNode n, auto& ctx) {
-      auto &d = g.getData(n);
-      auto task_type = std::get<3>(d.label);
-      if (task_type == 1) {
-        auto j = std::get<1>(d.label);
-        auto k = std::get<2>(d.label);
-        auto &b0a = *b0as.getLocal();
-        auto &b1a = *b1as.getLocal();
-        auto &ctx = *cublas_contexts.getLocal();
-        data_movement_timer.start();
-        auto stat = sa::cublas::SetMatrix(spd_bk(j, j, sa::slice(), sa::slice()), b0a);
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU Failed");
-        stat = sa::cublas::SetMatrix(spd_bk(j,k, sa::slice(), sa::slice()), b1a);
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU Failed");
-        double alpha = -1, beta = 1;
-        data_movement_timer.stop();
-        computation_calls_timer.start();
-        stat = sa::cublas::gemm(ctx, alpha, b1a, b1a.transpose(), beta, b0a);
-        if (stat != CUBLAS_STATUS_SUCCESS) {
-          print_cublas_status(stat);
-          GALOIS_DIE("gemm failed.");
-        }
-        cudaDeviceSynchronize();
-        computation_calls_timer.stop();
-        data_movement_timer.start();
-        stat = sa::cublas::GetMatrix(b0a, spd_bk(j, j, sa::slice(), sa::slice()));
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("receive failed.");
-        data_movement_timer.stop();
-      } else if (task_type == 2) {
-        auto j = std::get<2>(d.label);
-        auto b0 = *b0s.getLocal();
-        auto lwork = *lworks.getLocal();
-        auto lwork_size = *lwork_sizes.getLocal();
-        auto cusolver_handle = *cusolver_handles.getLocal();
-        data_movement_timer.start();
-        auto stat = cublasSetMatrix(block_size, block_size, sizeof(double), spd + j * block_size + j * block_size * dim_size, dim_size, b0, block_size);
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed. (5)");
-        int info = 0;
-        data_movement_timer.stop();
-        computation_calls_timer.start();
-        auto stat2 = cusolverDnDpotrf(cusolver_handle, CUBLAS_FILL_MODE_LOWER, block_size, b0, block_size, lwork, lwork_size, *dev_infos.getLocal());
-        if (stat2 != CUSOLVER_STATUS_SUCCESS) GALOIS_DIE("Cholesky block solve failed. (6)");
-        auto stat3 = cudaMemcpy(&info, *dev_infos.getLocal(), sizeof(int), cudaMemcpyDeviceToHost);
-        if (stat3 != cudaSuccess) GALOIS_DIE("Receive status after Cholesky on block failed. (7)");
-        if (info != 0) {
-          std::cout << info << std::endl;
-          std::stringstream ss;
-          if (info < 0) {
-            ss << "Parameter " << -info << " incorrect when passed to dpotrf. (8)";
-            GALOIS_DIE(ss.str());
+    galois::iterate({generation_task}),
+    [&](task_graph_node n, auto &ctx) {
+      auto &current_task_data = tree.getData(n);
+      auto task = current_task_data.task;
+      auto tree_node = current_task_data.tree_node;
+      auto &node_data = tree.getData(tree_node, galois::MethodFlag::UNPROTECTED);
+      if (task == generate_all) {
+        generate_tasks_lazy(tasks, tree, root_node, ctx);
+      } else if (task == recurse_summary) {
+        // TODO: Add an option for controlling where the recursion stops better.
+        if (is_final(tree, tree_node)) {
+          // Compute the summary, don't return, since this task will actually complete
+          // instead of just forward its dependencies.
+          node_data.summary = allocator.allocate(dims);
+          for (std::size_t j = 0; j < dims; j++) {
+            node_data.summary[j] = 0.;
           }
-          if (info > 0) {
-            ss << "Diagonal block " << j << " not positive definite at minor " << info << " during per-block Cholesky computation. (9)";
-            GALOIS_DIE(ss.str());
+          auto local_points = points(sa::slice(start_idx, start_idx + node_data.num_points), sa::slice());
+          for (std::size_t i = 0; i < node_data.num_points; i++) {
+            for (std::size_t j = 0; j < dims; j++) {
+              node_data_summary[j] += points(i, j);
+            }
           }
+          for (std::size_t j = 0; j < dims; j++) {
+            node_data.summary[j] / node_data.num_points;
+          }
+        } else {
+          // TODO: This seems a bit counterintuitive. Maybe more can be done to make it work cleanly.
+          tasks.remove_and_forward(n, task_label(compute_summary, tree_node));
+          for (auto e : tree.edges(tree_node)) {
+            ;
+          }
+          // Dependencies have been forwarded and the recursion task
+          // has been destroyed, so there's no need to remove the node,
+          // so just return now.
+          return;
         }
-        cudaDeviceSynchronize();
-        computation_calls_timer.stop();
-        data_movement_timer.start();
-        stat = cublasGetMatrix(block_size, block_size, sizeof(double), b0, block_size, spd + j * block_size + j * block_size * dim_size, dim_size);
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Receive from GPU failed. (10)");
-        data_movement_timer.stop();
-      } else if (task_type == 3) {
-        auto i = std::get<0>(d.label);
-        auto j = std::get<1>(d.label);
-        auto k = std::get<2>(d.label);
-        auto &b0a = *b0as.getLocal();
-        auto &b1a = *b1as.getLocal();
-        auto &b2a = *b2as.getLocal();
-        auto &ctx = *cublas_contexts.getLocal();
-        data_movement_timer.start();
-        auto stat = sa::cublas::SetMatrix(spd_bk(i,j,sa::slice(), sa::slice()), b0a);
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed");
-        stat = sa::cublas::SetMatrix(spd_bk(i,k,sa::slice(), sa::slice()), b1a);
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed.");
-        stat = sa::cublas::SetMatrix(spd_bk(j,k,sa::slice(), sa::slice()), b2a);
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed.");
-        data_movement_timer.stop();
-        computation_calls_timer.start();
-        double alpha = -1, beta = 1;
-        stat = sa::cublas::gemm(ctx, alpha, b1a, b2a.transpose(), beta, b0a);
-        if (stat != CUBLAS_STATUS_SUCCESS) {
-          print_cublas_status(stat);
-          GALOIS_DIE("gemm on GPU failed.");
-        }
-        cudaDeviceSynchronize();
-        computation_calls_timer.stop();
-        data_movement_timer.start();
-        stat = sa::cublas::GetMatrix(b0a, spd_bk(i,j,sa::slice(),sa::slice()));
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Receive from GPU failed.");
-        data_movement_timer.stop();
-      } else if (task_type == 4) {
-        auto i = std::get<1>(d.label);
-        auto j = std::get<2>(d.label);
-        auto b0 = *b0s.getLocal();
-        auto b1 = *b1s.getLocal();
-        //auto handle = *handles.getLocal();
-        auto handle = cublas_contexts.getLocal()->handle;
-        data_movement_timer.start();
-        auto stat = cublasSetMatrix(block_size, block_size, sizeof(double), spd + j * block_size + j * block_size * dim_size, dim_size, b0, block_size);
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed. (16)");
-        stat = cublasSetMatrix(block_size, block_size, sizeof(double), spd + i * block_size + j * block_size * dim_size, dim_size, b1, block_size);
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed. (17)");
-        data_movement_timer.stop();
-        computation_calls_timer.start();
-        double alpha = 1.;
-        stat = cublasDtrsm(handle, CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT, block_size, block_size, &alpha, b0, block_size, b1, block_size);
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("dtrsm operation failed. (18)");
-        cudaDeviceSynchronize();
-        computation_calls_timer.stop();
-        data_movement_timer.start();
-        stat = cublasGetMatrix(block_size, block_size, sizeof(double), b1, block_size, spd + i * block_size + j * block_size * dim_size, dim_size);
-        if (stat != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Receive from GPU failed. (19)");
-        data_movement_timer.stop();
-      } else if (task_type == 0) {
-        generate_tasks_lazy(nblocks, min_queue_size, max_queue_size, g, label_map, map_lock, ctx, graph_size, resume_generation_condition, condition_lock);
+      } else if (task == compute_summary) {
+        ;
+      } else if (task == signal_recursion_complete) {
+        ;
+      } else if (task == compute_near_forces) {
+        ;
+      } else if (task == compute_far_forces) {
+        ;
       } else {
+        // Unrecognized task type.
         GALOIS_DIE("Unrecognized task type.");
+        assert(false);
       }
+      tasks.remove_task(n);
+    },
+    galois::loopname("barneshut_tasks"),
+    galois::wl<PSChunk>(),
+    galois::no_conflicts()
+  )
+
+;;;;;;;;;;;;;;;
 
       updating_tasks_timer.start();
       {
@@ -800,5 +885,4 @@ int main(int argc, char** argv) {
   verification_timer.stop();
 
   return 0;
-  */
 }
