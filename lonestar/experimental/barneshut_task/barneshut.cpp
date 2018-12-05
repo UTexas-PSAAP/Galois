@@ -12,7 +12,8 @@
 #include <cuda_runtime.h>
 #include <cusolverDn.h>
 
-#include <boost/coroutine2/coroutine.hpp>
+//#include <boost/coroutine2/coroutine.hpp>
+#include <boost/functional/hash.hpp>
 
 #include "galois/Galois.h"
 #include "galois/gstl.h"
@@ -78,17 +79,28 @@ enum task_type {
 struct task_label {
   tree_node_t tree_node;
   task_type task;
+  bool operator==(const task_label& other) const {
+    return tree_node == other.tree_node && task == other.task;
+  }
+};
+
+struct task_label_hash {
+  std::size_t operator()(const task_label l) const {
+    return boost::hash_value(std::pair(reinterpret_cast<std::size_t>(l.tree_node), static_cast<unsigned int>(l.task)));
+    //return std::hash<std::size_t>()(reinterpret_cast<std::size_t>(l.tree_node)) ^ std::hash<unsigned int>()(static_cast<unsigned int>(l.task));
+  }
 };
 
 struct task_data {
   std::atomic<std::size_t> remaining_dependencies;
   task_label label;
+  task_data(std::size_t num_deps, task_label l) : remaining_dependencies(num_deps), label(l) {}
 };
 
 // Use Morph_Graph to get this up and running quickly.
 using task_graph_base = galois::graphs::MorphGraph<task_data, void, true>::with_no_lockable<true>::type;
 using task_graph_node = task_graph_base::GraphNode;
-using label_map_t = std::map<task_label, task_graph_node>;
+using label_map_t = std::unordered_map<task_label, task_graph_node, task_label_hash>;
 
 struct task_graph {
   task_graph_base g;
@@ -117,8 +129,8 @@ struct task_graph {
   // Create a new node with the given dependencies,
   // pushing it as ready if it's ready,
   // though not flushing the worklist.
-  task_graph_node new_task_node_from_label(auto &ctx, task_label label, std::size_t num_deps, task_label *dependencies, std::size_t prealloc_size = 0) {
-    auto n = g.createNode(std::max(prealloc_size, num_deps), label);
+  task_graph_node new_task_node_from_label(auto &ctx, task_label label, std::size_t num_deps, task_label *dependencies) {
+    auto n = g.createNode(num_deps, label);
     g.addNode(n);
     label_map[label] = n;
     for (std::size_t i = 0; i < num_deps; i++) {
@@ -136,11 +148,13 @@ struct task_graph {
 
   // User-facing task registration interface.
   // Create a task that depends on the given things.
-  void register_task(auto &ctx, task_label label, std::size_t num_deps, task_label* dependencies) {
+  void register_task(auto &ctx, task_label label, std::size_t num_deps, task_label* dependencies, bool send_and_wait = true) {
     std::unique_lock<std::mutex> lk{lock};
     new_task_node_from_label(ctx, label, num_deps, dependencies);
-    ctx.send_work();
-    condition.wait(lk, [&](){return g.size() < min_task_num;});
+    if (send_and_wait) {
+      ctx.send_work();
+      condition.wait(lk, [&](){return g.size() < min_task_num;});
+    }
   }
 
   // Hard to describe. This one needs some more thought/description.
@@ -151,21 +165,21 @@ struct task_graph {
   // Conceptually, the new label is the label for the new task
   // representing the work that happens after the "blocking calls" finish.
   // Note that this does not actually block the current execution thread.
-  void blocking_calls(auto &ctx, task_graph_node node, task_label new_label, std::size_t num_called, task_label *called) {
+  void continue_after(auto &ctx, task_graph_node node, task_label new_label, std::size_t num_called, task_label *called) {
     std::unique_lock<std::mutex> lk{lock};
     // Switch the label on the node from the current (now completed) task
     // instead of creating a new node and then forwarding its dependencies.
     // Conceptually that's what this does though.
     auto &data = g.getData(node, galois::MethodFlag::UNPROTECTED);
     auto &label = data.label;
-    label_map.erase(old_label);
+    label_map.erase(label);
     label = new_label;
     label_map[label] = node;
     data.remaining_dependencies = num_called;
     // Create the requested new tasks and make the newly labeled task depend on them.
     for (std::size_t i = 0; i < num_called; i++) {
       // Make the new replacement for this node depend on the created tasks.
-      auto called_node = new_task_node_from_label(ctx, called[i], 0, nullptr, 1);
+      auto called_node = new_task_node_from_label(ctx, called[i], 0, nullptr);
       g.addEdge(called_node, node);
     }
     // If nothing was actually called, the newly created task is ready
@@ -296,14 +310,14 @@ struct cloud_splitter {
     }
     assert(lower <= num_pts);
     if (!lower) {
-      bounds[dims * dim_idx] = split_point[dim_idx];
+      bounds[2 * dim_idx] = split_point[dim_idx];
       if (dim_idx + 1 == dims) {
         children.emplace_back(start_idx, num_pts, bounds);
       } else {
         split(start_idx, num_pts, bounds, dim_idx + 1);
       }
     } else if (lower == num_pts) {
-      bounds[dims * dim_idx + 1] = split_point[dim_idx];
+      bounds[2 * dim_idx + 1] = split_point[dim_idx];
       if (dim_idx + 1 == dims) {
         children.emplace_back(start_idx, num_pts, bounds);
       } else {
@@ -319,8 +333,8 @@ struct cloud_splitter {
         upper_bounds[i] = bounds[i];
         //lower_bounds[i] = bounds[i];
       }
-      lower_bounds[dims * dim_idx + 1] = split_point[dim_idx];
-      upper_bounds[dims * dim_idx] = split_point[dim_idx];
+      lower_bounds[2 * dim_idx + 1] = split_point[dim_idx];
+      upper_bounds[2 * dim_idx] = split_point[dim_idx];
       if (dim_idx + 1 == dims) {
         children.emplace_back(start_idx, lower, lower_bounds);
         children.emplace_back(start_idx + lower, num_pts - lower, upper_bounds);
@@ -448,17 +462,26 @@ void print_neighbors_all(tree_t &tree, tree_node_t root) {
 }
 
 void generate_tasks_lazy(task_graph &tsk, tree_t &tree, tree_node_t root, auto &ctx) {
-  task_label root_recursion{recurse_summary, root};
-  tsk.register_task(ctx, root_recursion, 0, nullptr);
-  task_label signal_recursion_complete{signal_summaries_completed, root};
+  task_label root_recursion{root, recurse_summary};
+  // Note that send and wait doesn't happen till after the signal task is created.
+  // This prevents the recursion task from completing and not being there
+  // when the signal task is registered.
+  tsk.register_task(ctx, root_recursion, 0, nullptr, false);
+  // TODO!!!!!!: This is actually an important part of what's going on here.
+  // This task is needed in case something after wants to refer to the recursion
+  // phase being finished.
+  // TODO: Perhaps a better way to do this is to allow tasks to depend on the original
+  // task and let it keep its original label in the label map instead of updating that
+  // when a blocking call happens.
+  task_label signal_recursion_complete{root, signal_summaries_completed};
   tsk.register_task(ctx, signal_recursion_complete, 1, &root_recursion);
   // TODO: After switching so execution waits only on ready tasks, just generate these tasks in a single pass
   // on the leaf nodes. It'll deadlock if that's done before the switch in waiting semantics.
   apply_to_leaves(tree, root, [&](auto &tree, auto leaf) {
-    tsk.register_task(ctx, task_label(compute_near_forces, leaf), 0, nullptr);
+    tsk.register_task(ctx, {leaf, compute_near_forces}, 0, nullptr);
   });
   apply_to_leaves(tree, root, [&](auto &tree, auto leaf) {
-    tsk.register_task(ctx, task_label(compute_far_forces, leaf), 1, &signal_recursion_complete);
+    tsk.register_task(ctx, {leaf, compute_far_forces}, 1, &signal_recursion_complete);
   });
 }
 
@@ -474,13 +497,13 @@ void set_array(sa::strided_array<T, dims> a, S value) {
   }
 }
 
-double set_differences_and_coef(sa::strided_array<double, 1> p1, sa::strided_array<double, 1> p2, sa::strided_array<double, 1> tmp) {
+double set_differences_and_distance2(sa::strided_array<double, 1> p1, sa::strided_array<double, 1> p2, sa::strided_array<double, 1> tmp) {
   assert(p1.axes[0].shape > 0);
   assert(p1.axes[0].shape == p2.axes[0].shape);
   double dist2 = 0;
   for (std::size_t j = 0; j < p1.axes[0].shape; j++) {
-    temp(i,j) = p1(j) - p2(j);
-    dist2 += temp(i,j) * temp(i,j);
+    tmp(j) = p1(j) - p2(j);
+    dist2 += tmp(j) * tmp(j);
   }
   return GRAVITATIONAL_CONSTANT / (dist2 * std::sqrt(dist2));
 }
@@ -488,98 +511,62 @@ double set_differences_and_coef(sa::strided_array<double, 1> p1, sa::strided_arr
 enum force_add_mode {bidirectional, unidirectional};
 
 template <force_add_mode mode>
-struct force_between_impl {
-  // This is an attempt to avoid repeating code between the unidirectional and bidirectional case.
-  // This would be nicer with non-scoped constexpr-if, but whatever.
-  if constexpr (mode == bidirectional) {
-    static void points(sa::strided_array<double, 1> p1, sa::strided_array<double, 1> p2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 1> f1, sa::strided_array<double, 1> f2) {
-      auto coef = set_differences_and_distance2(p1, p2, tmp);
-      for (std::size_t j = 0; j < p1.axes[0].shape; j++) {
-        auto force_in_direction = temp(j) * coef;
-        f1(j) -= force_in_direction;
-        f2(j) += force_in_direction;
-      }
-    }
-  } else {
-    static_assert(mode == unidirectional);
-    static void points(sa::strided_array<double, 1> p1, sa::strided_array<double, 1> p2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 1> f2) {
-      auto coef = set_differences_and_distance(p1, p2, tmp);
-      for (std::size_t j = 0; j < p1.axes[0].shape; j++) {
-        auto force_in_direction = temp(j) * coef;
-        f2(j) += force_in_direction;
-      }
+struct force_between_impl;
+
+template <>
+struct force_between_impl<bidirectional> {
+  static void between(sa::strided_array<double, 1> p1, sa::strided_array<double, 1> p2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 1> f1, sa::strided_array<double, 1> f2) {
+    auto coef = set_differences_and_distance2(p1, p2, tmp);
+    for (std::size_t j = 0; j < p1.axes[0].shape; j++) {
+      auto force_in_direction = tmp(j) * coef;
+      f1(j) -= force_in_direction;
+      f2(j) += force_in_direction;
     }
   }
-
-  if constexpr (mode == bidirectional) {
-    static void point_and_cloud(sa::strided_array<double, 1> p1, sa::strided_array<double, 2> ps2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 1> f1, sa::strided_array<double, 2> fs2) {
-      for (std::size_t i = 0; i < p2.axes[0]; i++) {
-        points(p1, ps2(i), tmp, f1, fs2(i));
-      }
-    }
-  } else {
-    static_assert(mode == unidirectional);
-    static void point_and_cloud(sa::strided_array<double, 1> p1, sa::strided_array<double 2> ps2, sa::strided_array<double 1> tmp, sa::strided_array<double, 2> fs2) {
-      for (std::size_t i = 0; i < p2.axes[0]; i++) {
-        points(p1, ps2(i), tmp, fs2(i));
-      }
+  static void between(sa::strided_array<double, 1> p1, sa::strided_array<double, 2> ps2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 1> f1, sa::strided_array<double, 2> fs2) {
+    for (std::size_t i = 0; i < ps2.axes[0].shape; i++) {
+      between(p1, ps2(i, sa::slice()), tmp, f1, fs2(i, sa::slice()));
     }
   }
-
-  if constexpr (mode == bidirectional) {
-    static void clouds(sa::strided_array<double, 2> ps1, sa::strided_array<double, 2> ps2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 2> fs1, sa::strided_array<double, 2> fs2) {
-      for (std::size_t i = 0; i < p1.axes[0].shape; i++) {
-        point_and_cloud(ps1(i), ps2, tmp, fs1(i), fs2);
-      }
-    }
-  } else {
-    static_assert(mode == unidirectional);
-    static void clouds(sa::strided_array<double, 2> ps1, sa::strided_array<double, 2> ps2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 2> fs2) {
-      for (std::size_t i = 0; i < p1.axes[0].shape; i++) {
-        points(ps1(i), ps2, tmp, fs2);
-      }
-    }
-  }
-
-  if constexpr (mode == bidirectional) {
-    template <std::size_t d1, std::size_t d2>
-    static void force_between(sa::strided_array<double, d1> p1, sa::strided_array<double, d2> p2, sa::strided_array<double, 1> tmp, sa::strided_array<double, d1> f1, sa::strided_array<double, d2> f2) {
-      static_assert(d1 <= d2, "Force of cloud on point not implemented.");
-      if constexpr (d1 == 1 && d2 == 1) {
-        points(p1, p2, tmp, f1, f2);
-      } else if (d1 == 1 && d2 == 2) {
-        point_and_cloud(p1, p2, tmp, f1, f2);
-      } else if (d1 == 2 && d2 == 2) {
-        clouds(p1, p2, tmp, f1, f2);
-      } else {
-        static_assert(false, "Unexpected dimensions of input arrays.");
-      }
-    }
-  } else {
-    static_assert(mode == unidirectional)
-    static void force_between(sa::strided_array<double, d1> p1, sa::strided_array<double, d2> p2, sa::strided_array<double, 1> tmp, sa::strided_array<double, d2> f2) {
-      static_assert(d1 <= d2, "Force of cloud on point not implemented.");
-      if constexpr (d1 == 1 && d2 == 1) {
-        points(p1, p2, tmp, f2);
-      } else if (d1 == 1 && d2 == 2) {
-        point_and_cloud(p1, p2, tmp, f2);
-      } else if (d1 == 2 && d2 == 2) {
-        clouds(p1, p2, tmp, f2);
-      } else {
-        static_assert(false, "Unexpected dimensions of input arrays.");
-      }
+  static void between(sa::strided_array<double, 2> ps1, sa::strided_array<double, 2> ps2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 2> fs1, sa::strided_array<double, 2> fs2) {
+    for (std::size_t i = 0; i < ps1.axes[0].shape; i++) {
+      between(ps1(i, sa::slice()), ps2, tmp, fs1(i, sa::slice()), fs2);
     }
   }
 };
 
-template <force_add_mode mode, std::size_t d1, std::size_t d2>
-using force_between = force_between_impl<mode>::template force_between<d1, d2>;
+template <>
+struct force_between_impl<unidirectional> {
+  static void between(sa::strided_array<double, 1> p1, sa::strided_array<double, 1> p2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 1> f2) {
+    auto coef = set_differences_and_distance2(p1, p2, tmp);
+    for (std::size_t j = 0; j < p1.axes[0].shape; j++) {
+      auto force_in_direction = tmp(j) * coef;
+      f2(j) += force_in_direction;
+    }
+  }
+  static void between(sa::strided_array<double, 1> p1, sa::strided_array<double, 2> ps2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 2> fs2) {
+    for (std::size_t i = 0; i < ps2.axes[0].shape; i++) {
+      between(p1, ps2(i, sa::slice()), tmp, fs2(i, sa::slice()));
+    }
+  }
+  static void between(sa::strided_array<double, 2> ps1, sa::strided_array<double, 2> ps2, sa::strided_array<double, 1> tmp, sa::strided_array<double, 2> fs2) {
+    for (std::size_t i = 0; i < ps1.axes[0].shape; i++) {
+      between(ps1(i, sa::slice()), ps2, tmp, fs2);
+    }
+  }
+};
+
+template <force_add_mode mode>
+auto force_between = [](auto &&... args) {force_between_impl<mode>::between(std::forward<decltype(args)>(args)...);};
+
+//template <force_add_mode mode, std::size_t d1, std::size_t d2>
+//using force_between = typename force_between_impl<mode>::template force_between<d1, d2>;
 
 void intra_cloud_force(sa::strided_array<double, 2> cloud, sa::strided_array<double, 1> temp, sa::strided_array<double, 2> forces) {
   assert(cloud.axes[0].shape == forces.axes[0].shape);
   assert(forces.axes[0].shape > 0);
   for (std::size_t i = 1; i < cloud.axes[0].shape; i++) {
-    force_between<bidirectional>(cloud(i, sa::slice()), cloud(sa::slice(i), sa::slice()), temp, forces(i, sa::slice()), forces(sa::slice(i), sa::slice));
+    force_between<bidirectional>(cloud(i, sa::slice()), cloud(sa::slice(i), sa::slice()), temp, forces(i, sa::slice()), forces(sa::slice(i), sa::slice()));
   }
 }
 
@@ -593,6 +580,8 @@ int main(int argc, char** argv) {
   auto points = base_arr(0, sa::slice(), sa::slice());
   auto velocities = base_arr(1, sa::slice(), sa::slice());
   auto forces = base_arr(2, sa::slice(), sa::slice());
+
+  //print_2d_array(points);
 
   task_graph tasks;
   tree_t tree;
@@ -692,8 +681,15 @@ int main(int argc, char** argv) {
             GALOIS_DIE("Uninitialized bounds.");
           }
           if (points(i, j) < data.bounds[2 * j] or data.bounds[2 * j + 1] < points(i, j)) {
-            std::cout << points(i,j) << std::endl;
-            std::cout << data.bounds[2 * j] << " " << data.bounds[2 * j + 1] << std::endl;
+            std::cout << "(";
+            for (std::size_t k = 0; k < dims - 1; k++) {
+              std::cout << points(i,k) << " ";
+            }
+            std::cout << points(i, dims - 1) << ")" << std::endl;
+            for (std::size_t k = 0; k < dims; k++) {
+              std::cout << "(" << data.bounds[2 * k] << " " << data.bounds[2 * k + 1] << ")";
+            }
+            std::cout << std::endl;
             GALOIS_DIE("Verification of tree construction failed");
           }
         }
@@ -707,24 +703,24 @@ int main(int argc, char** argv) {
 
   // Insert the generation task manually.
   // TODO: There should be some sort of machinery in the main task graph that hides this.
-  auto generation_task = tasks.g.createNode(0, task_label(root_node, generate_all));
-  tasks.g.addNode(init_node);
+  auto generation_task = tasks.g.createNode(std::size_t(0), task_label({root_node, generate_all}));
+  tasks.g.addNode(generation_task);
 
   // Set up temporary buffers used by the threads.
-  galois::substrate::PerThreadStorage<std::unique_ptr<double>> temp_buffers{};
+  galois::substrate::PerThreadStorage<std::unique_ptr<double[]>> temp_buffers{};
   sa::array_axes<1> tmp_axes{{{{std::size_t(dims), sizeof(double)}}}};
   galois::substrate::PerThreadStorage<sa::strided_array<double, 1>> temps{nullptr, tmp_axes};
   galois::on_each([&](unsigned int tid, unsigned int nthreads) {
-    *temp_buffers.getLocal() = std::make_unique<double*>(dims);
-    temps.getLocal()->data = (*temp_buffers.getLocal()).get();
+    *temp_buffers.getLocal() = std::make_unique<double[]>(dims);
+    *temps.getLocal() = sa::strided_array<double, 1>(temp_buffers.getLocal()->get(), tmp_axes);
   });
 
   galois::for_each(
     galois::iterate({generation_task}),
     [&](task_graph_node n, auto &ctx) {
-      auto &current_task_data = tree.getData(n);
-      auto task = current_task_data.task;
-      auto tree_node = current_task_data.tree_node;
+      auto &current_task_data = tasks.g.getData(n);
+      auto task = current_task_data.label.task;
+      auto tree_node = current_task_data.label.tree_node;
       auto &node_data = tree.getData(tree_node, galois::MethodFlag::UNPROTECTED);
       if (task == generate_all) {
         generate_tasks_lazy(tasks, tree, root_node, ctx);
@@ -737,152 +733,87 @@ int main(int argc, char** argv) {
           for (std::size_t j = 0; j < dims; j++) {
             node_data.summary[j] = 0.;
           }
-          auto local_points = points(sa::slice(start_idx, start_idx + node_data.num_points), sa::slice());
-          for (std::size_t i = 0; i < node_data.num_points; i++) {
+          auto local_points = points(sa::slice(node_data.start_idx, node_data.start_idx + node_data.num_pts), sa::slice());
+          for (std::size_t i = 0; i < node_data.num_pts; i++) {
             for (std::size_t j = 0; j < dims; j++) {
-              node_data_summary[j] += points(i, j);
+              node_data.summary[j] += local_points(i, j);
             }
           }
           for (std::size_t j = 0; j < dims; j++) {
-            node_data.summary[j] / node_data.num_points;
+            node_data.summary[j] /= node_data.num_pts;
           }
         } else {
-          // TODO: This seems a bit counterintuitive. Maybe more can be done to make it work cleanly.
-          tasks.remove_and_forward(n, task_label(compute_summary, tree_node));
+          // Currently no user-facing way to get the
+          // number of children of the current node,
+          // so compute while iterating over the edges.
+          std::size_t num_children = 0;
+          std::unique_ptr<task_label[], void(*)(task_label*)> new_labels(galois::Pow_2_VarSizeAlloc<task_label>().allocate(1 << dims), [](auto ptr){galois::Pow_2_VarSizeAlloc<task_label>().deallocate(ptr, 1 << dims);});
           for (auto e : tree.edges(tree_node)) {
-            ;
+            new_labels[num_children] = task_label({tree.getEdgeDst(e), recurse_summary});
+            num_children++;
           }
+          tasks.continue_after(ctx, n, task_label({tree_node, compute_summary}), num_children, new_labels.get());
           // Dependencies have been forwarded and the recursion task
           // has been destroyed, so there's no need to remove the node,
           // so just return now.
           return;
         }
       } else if (task == compute_summary) {
-        ;
-      } else if (task == signal_recursion_complete) {
-        ;
+        // If this were a leaf node it's summary would have already been
+        // computed instead of adding another layer of recursion.
+        node_data.summary = allocator.allocate(dims);
+        for (std::size_t j = 0; j < dims; j++) {
+          node_data.summary[j] = 0;
+        }
+        std::size_t num_children = 0;
+        for (auto e : tree.edges(tree_node, galois::MethodFlag::UNPROTECTED)) {
+          auto &child_summary = tree.getData(tree.getEdgeDst(e), galois::MethodFlag::UNPROTECTED).summary;
+          for (std::size_t j = 0; j < dims; j++) {
+            node_data.summary[j] += child_summary[j];
+          }
+          num_children++;
+        }
+        for (std::size_t j = 0; j < dims; j++) {
+          node_data.summary[j] /= num_children;
+        }
+      } else if (task == signal_summaries_completed) {
+        ; // Nothing to do here but avoid the unrecognized task type error by having a separate branch. 
       } else if (task == compute_near_forces) {
-        ;
+        auto current_pts = points(sa::slice(node_data.start_idx, node_data.start_idx + node_data.num_pts), sa::slice());
+        auto current_forces = forces(sa::slice(node_data.start_idx, node_data.start_idx + node_data.num_pts), sa::slice());
+        auto &tmp = *temps.getLocal();
+        intra_cloud_force(current_pts, tmp, current_forces);
+        apply_to_neighbors(tree, tree_node, [&](auto &tree, auto other) {
+          // Near field neighbors are all leaves.
+          if (is_final(tree, other)) {
+            auto &other_data = tree.getData(other, galois::MethodFlag::UNPROTECTED);
+            auto other_pts = points(sa::slice(other_data.start_idx, other_data.start_idx + other_data.num_pts), sa::slice());
+            //auto other_forces = forces(sa::slice(other_data.start_idx, other_data.start_idx + other_data.num_pts), sa::slice());
+            force_between<unidirectional>(other_pts, current_pts, tmp, current_forces);
+          }
+        });
       } else if (task == compute_far_forces) {
-        ;
+        auto current_pts = points(sa::slice(node_data.start_idx, node_data.start_idx + node_data.num_pts), sa::slice());
+        auto current_forces = forces(sa::slice(node_data.start_idx, node_data.start_idx + node_data.num_pts), sa::slice());
+        auto &tmp = *temps.getLocal();
+        apply_to_neighbors(tree, tree_node, [&](auto &tree, auto other) {
+          if (!is_final(tree, other)) {
+            auto &other_data = tree.getData(other, galois::MethodFlag::UNPROTECTED);
+            auto other_summary = sa::strided_array<double, 1>(other_data.summary, sa::array_axes<1>({{{std::size_t(dims), sizeof(double)}}}));
+            force_between<unidirectional>(other_summary, current_pts, tmp, current_forces);
+          }
+        });
       } else {
         // Unrecognized task type.
         GALOIS_DIE("Unrecognized task type.");
         assert(false);
       }
-      tasks.remove_task(n);
+      tasks.remove_task(ctx, n);
     },
     galois::loopname("barneshut_tasks"),
     galois::wl<PSChunk>(),
     galois::no_conflicts()
-  )
-
-;;;;;;;;;;;;;;;
-
-      updating_tasks_timer.start();
-      {
-        std::lock_guard<std::mutex> lock{map_lock};
-        for (auto e : g.edges(n, galois::MethodFlag::UNPROTECTED)) {
-          auto dst = g.getEdgeDst(e);
-          if (!(--g.getData(dst, galois::MethodFlag::UNPROTECTED).waiting_on)) {
-            ctx.push(dst);
-          }
-        }
-        // Now remove this node entirely.
-        g.removeNode(n);
-        label_map.erase(d.label);
-      
-        if ((graph_size--) == min_queue_size) {
-          resume_generation_condition.notify_one();
-        }
-      }
-      updating_tasks_timer.stop();
-    },
-    galois::loopname("cholesky_tasks"), galois::wl<PSChunk>(),
-    galois::no_conflicts()
   );
-
-  {
-    auto spd2_manager = generate_symmetric_positive_definite(dim_size, seed);
-    auto spd2 = spd2_manager.get();
-    galois::StatTimer cusolver_dpotrf_with_movement{"cusolver dpotrf with movement time"};
-    galois::StatTimer cusolver_dpotrf_timer{"cusolver dpotrf time"};
-    int info;
-    double *dev_spd2;
-    auto stat = cudaMalloc(&dev_spd2, dim_size * dim_size * sizeof(double));
-    if (stat != cudaSuccess) {
-      GALOIS_DIE("Failed to allocate GPU buffers for fully on-device cholesky.");
-    }
-    cusolver_dpotrf_with_movement.start();
-    auto stat2 = cublasSetMatrix(dim_size, dim_size, sizeof(double), spd2, dim_size, dev_spd2, dim_size);
-    if (stat2 != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Send to GPU failed.");
-    int work_size;
-    auto stat3 = cusolverDnDpotrf_bufferSize(*cusolver_handles.getLocal(), CUBLAS_FILL_MODE_LOWER, dim_size, dev_spd2, dim_size, &work_size);
-    if (stat3 != CUSOLVER_STATUS_SUCCESS) GALOIS_DIE("Could not get work size for cusolver dpotrf.");
-    double *work;
-    stat = cudaMalloc(&work, work_size * sizeof(double));
-    if (stat != cudaSuccess) GALOIS_DIE("Failed to allocate gpu work buffer");
-    cusolver_dpotrf_timer.start();
-    stat3 = cusolverDnDpotrf(*cusolver_handles.getLocal(), CUBLAS_FILL_MODE_LOWER, dim_size, dev_spd2, dim_size, work, work_size, *dev_infos.getLocal());
-    if (stat3 != CUSOLVER_STATUS_SUCCESS) GALOIS_DIE("Cholesky block solve failed.");
-    stat = cudaMemcpy(&info, *dev_infos.getLocal(), sizeof(int), cudaMemcpyDeviceToHost);
-    if (stat != cudaSuccess) GALOIS_DIE("Receive status after Cholesky on block failed. (7)");
-    if (info != 0) {
-      std::cout << info << std::endl;
-      std::stringstream ss;
-      if (info < 0) {
-        ss << "Parameter " << -info << " incorrect when passed to dpotrf.";
-        GALOIS_DIE(ss.str());
-      }
-      if (info > 0) {
-        ss << "Not positive definite at minor " << info << " during per-block Cholesky computation.";
-        GALOIS_DIE(ss.str());
-      }
-    }
-    cudaDeviceSynchronize();
-    cusolver_dpotrf_timer.stop();
-    stat2 = cublasGetMatrix(dim_size, dim_size, sizeof(double), dev_spd2, dim_size, spd2, dim_size);
-    if (stat2 != CUBLAS_STATUS_SUCCESS) GALOIS_DIE("Receive failed.");
-    cusolver_dpotrf_with_movement.stop();
-  }
-  
-  //std::cout << "result:" << std::endl;
-  //print_mat(spd, dim_size, dim_size, dim_size);
-
-  // Now free the per-thread resources.
-  galois::on_each([&](unsigned int tid, unsigned int nthreads) {
-    auto stat = cudaFree(reinterpret_cast<void*>(*b0s.getLocal()));
-    if (stat != cudaSuccess) {
-      GALOIS_DIE("Failed to free gpu buffer for blocks.");
-    }
-    stat = cudaFree(reinterpret_cast<void*>(*lworks.getLocal()));
-    if (stat != cudaSuccess) {
-      GALOIS_DIE("Failed to free gpu buffer for cholesky workspace.");
-    }
-    stat = cudaFree(reinterpret_cast<void*>(*dev_infos.getLocal()));
-    if (stat != cudaSuccess) {
-      GALOIS_DIE("Failed to free gpu buffer for cholesky return status.");
-    }
-    stat = cudaFree(reinterpret_cast<void*>(*b1s.getLocal()));
-    if (stat != cudaSuccess) {
-      GALOIS_DIE("Failed to free gpu buffer for blocks.");
-    }
-    stat = cudaFree(reinterpret_cast<void*>(*b2s.getLocal()));
-    if (stat != cudaSuccess) {
-      GALOIS_DIE("Failed to free gpu buffer for blocks.");
-    }
-    auto stat2 = cusolverDnDestroy(*cusolver_handles.getLocal());
-    if (stat2 != CUSOLVER_STATUS_SUCCESS) {
-      GALOIS_DIE("Failed to free cusolver resources.");
-    }
-    if (stat != cudaSuccess) {
-      GALOIS_DIE("Failed to reset cuda device after use");
-    }
-  });
-
-  verification_timer.start();
-  check_correctness(spd, dim_size, seed, tolerance);
-  verification_timer.stop();
 
   return 0;
 }
