@@ -40,8 +40,9 @@ static llvm::cl::opt<unsigned long long> dims("dims", llvm::cl::desc("Number of 
 static llvm::cl::opt<unsigned long long> num_pts("num_pts", llvm::cl::desc("Number of generated points."), llvm::cl::init(10u));
 static llvm::cl::opt<unsigned long long> max_group_size("max_group_size", llvm::cl::desc("Max number of points per leaf in tree."), llvm::cl::init(1u));
 static llvm::cl::opt<unsigned long long> seed("seed", llvm::cl::desc("Seed for random number generation."), llvm::cl::init(0u));
-static llvm::cl::opt<double> error_threshold("error_threshold", llvm::cl::desc("Maximum allowable error at a given point during verification."), llvm::cl::init(1E-15));
 static llvm::cl::opt<bool> verify("verify", llvm::cl::desc("Whether or not to run the verification."), llvm::cl::init(true));
+static llvm::cl::opt<bool> verify_expensive("verify_expensive", llvm::cl::desc("Whether or not to verify the force computation against the naive version of the algorithm (expensive)."), llvm::cl::init(false));
+static llvm::cl::opt<double> error_threshold("error_threshold", llvm::cl::desc("Maximum allowable error when verifying force computation."), llvm::cl::init(1E-10));
 static llvm::cl::opt<unsigned long long> task_gen_threshold("task_gen_threshold", llvm::cl::desc("When the threshold of ready tasks dips below this threshold, generate more."), llvm::cl::init(500u));
 
 using PSChunk = galois::worklists::PerSocketChunkFIFO<1>;
@@ -820,6 +821,24 @@ int main(int argc, char** argv) {
     galois::wl<PSChunk>(),
     galois::no_conflicts()
   );
+
+  if (verify_expensive) {
+    // This is a naive implementation of the O(n^2) algorithm,
+    // so it's incredibly slow and should not run by default.
+    auto precise_forces_buffer = std::make_unique<double[]>(dims * num_pts);
+    sa::strided_array<double, 2> precise_forces{precise_forces_buffer.get(), sa::array_axes<2>({{{num_pts, dims * sizeof(double)}, {dims, sizeof(double)}}})};
+    // Just reu-se the temp from earlier.
+    auto &tmp = *temps.getLocal();
+    intra_cloud_force(points, tmp, precise_forces);
+    for (std::size_t i = 0; i < points.axes[0].shape; i++) {
+      for (std::size_t j = 0; j < points.axes[1].shape; j++) {
+        // Check relative error, but only relative to absolute value of current force in current direction.
+        if (std::abs(forces(i, j) - precise_forces(i, j)) / std::abs(precise_forces(i, j)) < error_threshold) {
+          GALOIS_DIE("Verification of force computation failed. Too large a difference between the result of the naive algorithm and the tree based code.");
+        }
+      }
+    }
+  }
 
   return 0;
 }
