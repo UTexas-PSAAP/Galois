@@ -42,8 +42,7 @@ static llvm::cl::opt<unsigned long long> max_group_size("max_group_size", llvm::
 static llvm::cl::opt<unsigned long long> seed("seed", llvm::cl::desc("Seed for random number generation."), llvm::cl::init(0u));
 static llvm::cl::opt<double> error_threshold("error_threshold", llvm::cl::desc("Maximum allowable error at a given point during verification."), llvm::cl::init(1E-15));
 static llvm::cl::opt<bool> verify("verify", llvm::cl::desc("Whether or not to run the verification."), llvm::cl::init(true));
-static llvm::cl::opt<unsigned long long> max_task_num("max_task_num", llvm::cl::desc("Maximum number of tasks."), llvm::cl::init(100u));
-static llvm::cl::opt<unsigned long long> min_task_num("min_task_num", llvm::cl::desc("Minimum number of tasks."), llvm::cl::init(50u));
+static llvm::cl::opt<unsigned long long> task_gen_threshold("task_gen_threshold", llvm::cl::desc("When the threshold of ready tasks dips below this threshold, generate more."), llvm::cl::init(500u));
 
 using PSChunk = galois::worklists::PerSocketChunkFIFO<1>;
 
@@ -110,6 +109,7 @@ struct task_graph {
   // places appear as atomic to the observer.
   std::mutex lock;
   std::condition_variable condition;
+  std::size_t ready_tasks = 0;
 
   task_graph() = default;
   task_graph(task_graph&) = delete;
@@ -119,11 +119,6 @@ struct task_graph {
   task_graph(task_graph&&) = delete;
   task_graph& operator=(task_graph&) = delete;
   task_graph& operator=(task_graph&&) = delete;
-
-  void sleep_till_size(std::size_t size) {
-    std::unique_lock<std::mutex> lk{lock};
-    condition.wait(lk, [&](){return g.size() < size;});
-  }
 
   // Helper function. DOESN'T LOCK.
   // Create a new node with the given dependencies,
@@ -140,6 +135,7 @@ struct task_graph {
       } else {
         if (!(--g.getData(n).remaining_dependencies)) {
           ctx.push(n);
+          ready_tasks++;
         }
       }
     }
@@ -150,10 +146,14 @@ struct task_graph {
   // Create a task that depends on the given things.
   void register_task(auto &ctx, task_label label, std::size_t num_deps, task_label* dependencies, bool send_and_wait = true) {
     std::unique_lock<std::mutex> lk{lock};
-    new_task_node_from_label(ctx, label, num_deps, dependencies);
+    auto n = new_task_node_from_label(ctx, label, num_deps, dependencies);
+    if (!num_deps) {
+      ctx.push(n);
+      ready_tasks++;
+    }
     if (send_and_wait) {
       ctx.send_work();
-      condition.wait(lk, [&](){return g.size() < min_task_num;});
+      condition.wait(lk, [&](){return ready_tasks < task_gen_threshold;});
     }
   }
 
@@ -181,11 +181,16 @@ struct task_graph {
       // Make the new replacement for this node depend on the created tasks.
       auto called_node = new_task_node_from_label(ctx, called[i], 0, nullptr);
       g.addEdge(called_node, node);
+      ctx.push(called_node);
     }
     // If nothing was actually called, the newly created task is ready
     // and must be marked as such since no other task will mark it ready later.
     if (num_called == 0) {
       ctx.push(node);
+    } else {
+      // Currently executed task is no longer ready/running.
+      // but the called tasks are all ready.
+      ready_tasks += num_called - 1;
     }
     // Now that all that is done, flush the work list.
     // TODO: Confirm that this can be done at a finer granularity
@@ -198,11 +203,12 @@ struct task_graph {
       auto dst = g.getEdgeDst(e);
       if (!(--g.getData(dst, galois::MethodFlag::UNPROTECTED).remaining_dependencies)) {
         ctx.push(dst);
+        ready_tasks++;
       }
     }
     g.removeNode(node);
-    if (g.size() == min_task_num) {
-      lk.release();
+    ready_tasks--;
+    if (ready_tasks == task_gen_threshold - 1) {
       condition.notify_one();
     }
   }
