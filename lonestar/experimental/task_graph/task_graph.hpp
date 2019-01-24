@@ -228,7 +228,7 @@ task create_task_node(void (*operation)(void*, void*), void *closure, std::size_
   // the task has to be queued as ready, but the caller
   // is responsible for doing that since this routine may be
   // used to create ready tasks outside of galois parallel contexts.
-  return node_ref;
+  return task(node_ref);
 }
 
 // Not user-facing.
